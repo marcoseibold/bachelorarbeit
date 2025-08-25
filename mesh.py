@@ -4,10 +4,18 @@ import numpy as np
 import trimesh
 import nvdiffrast.torch as dr
 import matplotlib.pyplot as plt
+import argparse
+
+# Parsing
+parser = argparse.ArgumentParser(description="Render mesh")
+parser.add_argument("--mesh", type=str, required=True, help="Path to mesh")
+parser.add_argument("--outdir", type=str, default="renders", help="Output directory for rendered views")
+args = parser.parse_args()
 
 RESOLUTION = (512, 512)
 DEVICE = 'cuda'
-MESH_PATH = 'bunny.obj'
+MESH_PATH = args.mesh
+OUTDIR = args.outdir
 
 # Load and adjust mesh
 mesh = trimesh.load(MESH_PATH, process=True)
@@ -57,8 +65,8 @@ def perspective(fovy, aspect, near, far):
 
 def get_mvp_matrix(angle_deg):
     angle_rad = np.radians(angle_deg)
-    radius = 5.0
-    height = 1.0
+    radius = 7.0
+    height = -3.0
     eye = np.array([np.sin(angle_rad) * radius, height, np.cos(angle_rad) * radius], dtype=np.float32)
     center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
@@ -76,7 +84,7 @@ ctx = dr.RasterizeGLContext()
 
 # Render some angles
 angles = [0, 45, 90, 135, 180, 225, 270, 315]
-os.makedirs("renders", exist_ok=True)
+os.makedirs(OUTDIR, exist_ok=True)
 
 for angle in angles:
     mvp = get_mvp_matrix(angle)  # [1, 4, 4]
@@ -122,7 +130,7 @@ for angle in angles:
     rgb = np.nan_to_num(rgb, nan=1.0) 
 
     # Saving
-    filename = f"renders/view_{angle}.png"
+    filename = os.path.join(OUTDIR, f"view_{angle}.png")
     plt.imsave(filename, rgb)
     print(f"Image saved: {filename}")
 
