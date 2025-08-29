@@ -38,6 +38,116 @@ faces = torch.tensor(faces_np, device=DEVICE).unsqueeze(0)        # [1, F, 3]
 print("Vertices:", mesh.vertices.shape)
 print("Faces:", mesh.faces.shape)
 
+def parse_mtl_file(mtl_path):
+    """Return dict: material_name -> Kd(np.array float32 [3])"""
+    materials = {}
+    if not os.path.exists(mtl_path):
+        return materials
+    current = None
+    with open(mtl_path, 'r', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            key = parts[0].lower()
+            if key == 'newmtl':
+                current = ' '.join(parts[1:])
+                materials[current] = {'Kd': np.array([0.8, 0.8, 0.8], dtype=np.float32)}
+            elif key == 'kd' and current is not None:
+                vals = list(map(float, parts[1:4]))
+                materials[current]['Kd'] = np.array(vals, dtype=np.float32)
+            # Note: map_Kd (texture) is ignored here; can be added later.
+    return {k: v['Kd'] for k, v in materials.items()}
+
+V = vertices_np.shape[0]
+colors_vertex = None  # will be numpy (V,3) float32
+
+if hasattr(mesh.visual, 'vertex_colors') and mesh.visual.vertex_colors is not None and len(mesh.visual.vertex_colors) == V:
+    vc = mesh.visual.vertex_colors[:, :3]  # may be RGBA or RGB in 0..255
+    # If values are >1 assume 0-255
+    if vc.max() > 1.0:
+        vc = vc.astype(np.float32) / 255.0
+    colors_vertex = vc.astype(np.float32)
+    print("Using vertex colors from mesh.visual.vertex_colors")
+
+if colors_vertex is None:
+    # find mtllib relative to obj path
+    obj_dir = os.path.dirname(os.path.abspath(MESH_PATH))
+    mtllib_name = None
+    face_materials = []  # per face material name (in face order encountered)
+    # We will parse the obj in order and map each 'f' line to the current material
+    cur_mtl = None
+    with open(MESH_PATH, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            key = parts[0].lower()
+            if key == 'mtllib':
+                mtllib_name = ' '.join(parts[1:])
+            elif key == 'usemtl':
+                cur_mtl = ' '.join(parts[1:])
+            elif key == 'f':
+                # One face encountered: record current material (may be None)
+                face_materials.append(cur_mtl)
+    # If we found mtllib, try parsing it
+    materials_kd = {}
+    if mtllib_name is not None:
+        mtllib_path = os.path.join(obj_dir, mtllib_name)
+        materials_kd = parse_mtl_file(mtllib_path)
+        print("Parsed MTL:", list(materials_kd.keys()))
+    else:
+        print("No mtllib found in OBJ header; falling back to default color")
+
+    # Now map face_materials to face colors
+    F = faces_np.shape[0]
+    # face_materials length should equal number of faces encountered in file
+    if len(face_materials) != F:
+        # Sometimes trimesh triangulation / ordering may differ; attempt to use trimesh.visual.face_materials if available
+        if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
+            print("Warning: face count mismatch. Trying mesh.visual.material or face_materials from trimesh.")
+        # fallback: set all faces to default material
+        face_colors = np.tile(np.array([0.8, 0.8, 0.8], dtype=np.float32), (F,1))
+    else:
+        face_colors = np.zeros((F,3), dtype=np.float32)
+        for i, mat_name in enumerate(face_materials):
+            if mat_name is None:
+                face_colors[i] = np.array([0.8,0.8,0.8], dtype=np.float32)
+            else:
+                kd = materials_kd.get(mat_name, None)
+                if kd is None:
+                    # fallback default
+                    face_colors[i] = np.array([0.8,0.8,0.8], dtype=np.float32)
+                else:
+                    face_colors[i] = kd
+
+    # Convert face colors to per-vertex color by averaging adjacent faces
+    vertex_color_sum = np.zeros((V,3), dtype=np.float32)
+    vertex_face_count = np.zeros((V,), dtype=np.int32)
+    for fi in range(F):
+        f = faces_np[fi]  # indices (0-based) from trimesh
+        c = face_colors[fi]
+        for vi in f:
+            vertex_color_sum[vi] += c
+            vertex_face_count[vi] += 1
+    # avoid division by zero
+    mask = vertex_face_count > 0
+    colors_vertex = np.zeros_like(vertex_color_sum)
+    colors_vertex[mask] = (vertex_color_sum[mask].T / vertex_face_count[mask]).T
+    # for isolated vertices (shouldn't be), set default
+    colors_vertex[~mask] = np.array([0.8,0.8,0.8], dtype=np.float32)
+    print("Computed per-vertex colors from face materials")
+
+# As a safety, ensure colors_vertex shape and range
+if colors_vertex is None:
+    colors_vertex = np.tile(np.array([0.8,0.8,0.8], dtype=np.float32), (V,1))
+colors_vertex = np.clip(colors_vertex, 0.0, 1.0).astype(np.float32)
+
+# Convert to torch tensor [1, V, 3]
+colors = torch.tensor(colors_vertex, device=DEVICE).unsqueeze(0)  # [1, V, 3]
+
 # Helper functions
 def look_at(eye, center, up):
     f = center - eye
@@ -77,7 +187,7 @@ def get_mvp_matrix(angle_deg):
     return torch.tensor(mvp, dtype=torch.float32, device=DEVICE).unsqueeze(0)  # [1,4,4]
 
 # colors = torch.ones((1, vertices.shape[1], 3), dtype=torch.float32, device=DEVICE) * 0.8
-colors = torch.rand((1, vertices.shape[1], 3), device=DEVICE)
+# colors = torch.rand((1, vertices.shape[1], 3), device=DEVICE)
 
 
 ctx = dr.RasterizeGLContext()
