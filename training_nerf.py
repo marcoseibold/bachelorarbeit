@@ -63,6 +63,33 @@ def look_at(eye, center, up):
     m[:3, 3] = -m[:3, :3] @ eye
     return m
 
+def pose_spherical(az_deg, el_deg, radius):
+    """
+    Return camera-to-world matrix for azimuth (deg) and elevation (deg) using
+    the NeRF-like convention (phi from top).
+    az_deg: degrees around Y axis (0 = +Z)
+    el_deg: elevation in degrees (0 = horizon, positive = up)
+    """
+    # convert deg -> radians
+    az = np.radians(az_deg)
+    el = np.radians(el_deg)
+
+    # NeRF-like mapping
+    x = radius * np.cos(el) * np.sin(az)
+    y = radius * np.sin(el)
+    z = radius * np.cos(el) * np.cos(az)
+    eye = np.array([x, y, z], dtype=np.float32)
+
+    center = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    # make view (world -> camera) then invert to cam2world
+    view = look_at(eye, center, up)
+    cam2world = np.linalg.inv(view).astype(np.float32)
+    return cam2world
+
+
+
 def perspective(fovy, aspect, near, far):
     f = 1.0 / np.tan(fovy / 2.0)
     m = np.zeros((4, 4), dtype=np.float32)
@@ -72,6 +99,22 @@ def perspective(fovy, aspect, near, far):
     m[2, 3] = (2 * far * near) / (near - far)
     m[3, 2] = -1.0
     return m
+
+def mvp_from_cam(cam2world, H, W, focal, near=0.1, far=10.0):
+    """
+    Build MVP = proj @ view from a camera-to-world matrix (cam2world).
+    cam2world: numpy array or torch (we expect numpy here).
+    focal: focal in pixels (float).
+    """
+    # ensure numpy array
+    if isinstance(cam2world, torch.Tensor):
+        cam2world = cam2world.cpu().numpy()
+    view = np.linalg.inv(cam2world).astype(np.float32)  # world->camera (view)
+    # compute fovy from focal and image height (same convention used elsewhere)
+    fovy = 2.0 * np.arctan(float(H) / (2.0 * float(focal)))
+    proj = perspective(fovy, float(W) / float(H), near, far)
+    return proj @ view
+
 
 def get_mvp_matrix(angle_deg, H, W, device):
     angle_rad = np.radians(angle_deg)
@@ -85,20 +128,19 @@ def get_mvp_matrix(angle_deg, H, W, device):
     mvp = proj @ view
     return torch.tensor(mvp, dtype=torch.float32, device=DEVICE).unsqueeze(0)  # [1,4,4]
 
-# --- Load and adjust mesh (robust gegen trimesh.Scene) ---
+# Load and adjust mesh
 loaded = trimesh.load(MESH_PATH, process=True)
 
-# Wenn Scene zurückkommt: versuche, zu einem einzelnen Trimesh zu machen.
+# If scene, create one trimesh
 if isinstance(loaded, trimesh.Scene):
     print(f"Info: '{MESH_PATH}' wurde als trimesh.Scene geladen (mehrere Geometrien).")
-    # erster Versuch: .dump(concatenate=True) (wendet Node-Transforms an, falls vorhanden)
     try:
         mesh = loaded.dump(concatenate=True)
         if not isinstance(mesh, trimesh.Trimesh):
             raise RuntimeError("scene.dump did not return a Trimesh")
         print("Scene -> einzelnes Trimesh via scene.dump(concatenate=True).")
     except Exception:
-        # Fallback: nur geometrien zusammenhängen (kann Node-Transforms ignorieren)
+        # Fallback
         geoms = list(loaded.geometry.values())
         if len(geoms) == 0:
             raise ValueError(f"Die Scene enthält keine Geometrien: {MESH_PATH}")
@@ -109,25 +151,24 @@ if isinstance(loaded, trimesh.Scene):
             mesh = trimesh.util.concatenate(tuple(geoms))
             print(f"Scene mit {len(geoms)} Geometrien -> mittels trimesh.util.concatenate zusammengeführt.")
 else:
-    mesh = loaded  # schon ein Trimesh
+    mesh = loaded
 
-# Sicherheit: jetzt muss es ein Trimesh sein
+# Safety check
 if not isinstance(mesh, trimesh.Trimesh):
     raise TypeError(f"Erwartete trimesh.Trimesh, bekam stattdessen: {type(mesh)}")
 
-# Falls die Faces nicht trianguliert sind, triangulieren
+# triangulate
 if mesh.faces.ndim == 2 and mesh.faces.shape[1] != 3:
     print("Mesh hat keine Dreiecks-Faces -> trianguliere.")
     mesh = mesh.triangulate()
 
-# Normalisierung / Zentrierung wie vorher
+# Normalization / Centering
 mesh_vertices = mesh.vertices.astype(np.float32)
 mesh_vertices -= mesh_vertices.mean(axis=0)
 mesh_vertices /= np.max(np.linalg.norm(mesh_vertices, axis=1))
 mesh_vertices *= 2.0
 mesh_vertices[:, 1] *= -1
 
-# setzte die veränderten Koordinaten zurück in mesh (damit später visual/uv stimmt)
 mesh.vertices = mesh_vertices
 
 # Create vertices and faces
@@ -161,7 +202,7 @@ target_imgs = []
 target_masks = []
 mvps = []
 
-# Versuche Vertex Colors oder Textur
+# Try Vertex Colors or Texture
 use_vertex_colors = False
 use_texture = False
 texture_tensor = None
@@ -169,7 +210,7 @@ uv_attr = None
 
 if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors.shape[1] >= 3:
     unique_colors = np.unique(mesh.visual.vertex_colors[:, :3], axis=0)
-    if len(unique_colors) > 1:  # mehr als eine Farbe → sinnvoll
+    if len(unique_colors) > 1:
         use_vertex_colors = True
         vcol = mesh.visual.vertex_colors[:, :3] / 255.0
         vcol = np.clip(vcol, 0.0, 1.0).astype(np.float32)
@@ -238,40 +279,109 @@ if not use_vertex_colors and not use_texture:
     use_vertex_colors = True
     print("No vertex colors or texture found → using position-based fallback colors")
 
-# Erzeuge Target-Bilder für alle Ansichten
-for angle in ANGLES:
-    mvp = get_mvp_matrix(angle, H, W, DEVICE)
-    mvps.append(mvp)
+# Spiral-like camera setup
+radius = 5.0    # distance camera to object
+min_elev = -60.0    # lower elevation
+max_elev = 60.0 # upper elevation
+turns = 2.5 # number of full turns the spiral makes
+N = 200 # total number of views to generate
 
+# parameter t runs from 0..1, gives a continuous path
+t_vals = np.linspace(0.0, 1.0, N)
+
+# sample elevation uniformly in sin
+min_rad = np.radians(min_elev)
+max_rad = np.radians(max_elev)
+sin_vals = np.linspace(np.sin(min_rad), np.sin(max_rad), N)  # top->bottom
+elevations = np.degrees(np.arcsin(sin_vals))                 # degrees
+
+# azimuth increases steadily with t to create spiral
+azimuths = 360.0 * turns * t_vals
+
+cam2worlds = []
+mvps = []
+target_imgs = []
+target_masks = []
+
+# focal: keep a consistent vertical fov of 45 deg as before
+focal_pixel = 0.5 * W / np.tan(0.5 * np.radians(45.0))
+
+for i, (az, el) in enumerate(zip(azimuths, elevations)):
+    cam2world = pose_spherical(az, el, radius)   # camera->world 4x4
+    cam2worlds.append(cam2world)
+
+    # compute mvp (proj @ view) from cam2world
+    mvp_np = mvp_from_cam(cam2world, H, W, focal=focal_pixel, near=0.1, far=10.0)
+    mvps.append(torch.tensor(mvp_np, dtype=torch.float32, device=DEVICE).unsqueeze(0))
+
+    # rasterize & sample to generate target_imgs / masks
     ones = torch.ones_like(vertices[:, :, :1])
-    vertices_h = torch.cat([vertices, ones], dim=-1)  # [1,V,4]
-    pos_clip = torch.matmul(vertices_h, mvp.transpose(1, 2))  # [1,V,4]
-
-    rast_out, rast_db = dr.rasterize(ctx, pos_clip, faces_unbatched, resolution=[H, W])
+    pos_clip = torch.matmul(torch.cat([vertices, ones], dim=-1), mvps[-1].transpose(1,2))
+    rast_out, _ = dr.rasterize(ctx, pos_clip, faces_unbatched, resolution=[H, W])
 
     if use_vertex_colors:
-        attr = vcol_tensor  # [V,3]
-        rgb_t, _ = dr.interpolate(attr, rast_out, faces_unbatched)  # [1,H,W,3]
+        rgb_t, _ = dr.interpolate(vcol_tensor, rast_out, faces_unbatched)
         rgb_t = rgb_t[0].cpu().numpy()
-
     elif use_texture:
-        uv_map, _ = dr.interpolate(uv_attr, rast_out, faces_unbatched)  # [1,H,W,2]
-        uv_grid = uv_map * 2.0 - 1.0  # [0,1] → [-1,1]
+        uv_map, _ = dr.interpolate(uv_attr, rast_out, faces_unbatched)
+        uv_grid = uv_map * 2.0 - 1.0
         uv_grid = uv_grid.to(dtype=torch.float32, device=texture_tensor.device)
-        # grid_sample erwartet [N,H,W,2]
-        tex_sampled = F.grid_sample(texture_tensor, uv_grid,
-                                    mode="bilinear", align_corners=True)
-        rgb_t = tex_sampled.permute(0, 2, 3, 1)[0].detach().cpu().numpy()
+        tex_sampled = F.grid_sample(texture_tensor, uv_grid, mode="bilinear", align_corners=True)
+        rgb_t = tex_sampled.permute(0,2,3,1)[0].detach().cpu().numpy()
+    else:
+        rgb_t = np.zeros((H,W,3), dtype=np.float32)
 
     mask = (rast_out[0, ..., 3] > 0).cpu().numpy()
     target_imgs.append(rgb_t.astype(np.float32))
     target_masks.append(mask.astype(np.bool_))
 
-print("Target images generated for angles:", ANGLES)
+n_views = len(mvps)
+print(f"Target images generated: {n_views} spiral views (turns={turns}, N={N})")
+
+
+# Save a 3D scatter of camera positions to check distribution
+try:
+    # Visualization: sphere + spiral camera path
+    from mpl_toolkits.mplot3d import Axes3D
+
+    # camera positions (extract from cam2worlds)
+    cam_positions = np.array([c[:3,3] for c in cam2worlds])
+
+    fig = plt.figure(figsize=(10,8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # plot translucent unit sphere wireframe (scale to radius)
+    u = np.linspace(0, 2*np.pi, 60)
+    v = np.linspace(0, np.pi, 30)
+    x = np.outer(np.cos(u), np.sin(v)) * radius
+    y = np.outer(np.sin(u), np.sin(v)) * radius
+    z = np.outer(np.ones_like(u), np.cos(v)) * radius
+    ax.plot_wireframe(x, y, z, color='0.7', linewidth=0.4, alpha=0.8)
+
+    # cameras as red dots, with labels along spiral
+    ax.scatter(cam_positions[:,0], cam_positions[:,1], cam_positions[:,2], c='red', s=30)
+    for idx, pos in enumerate(cam_positions):
+        # Annotate with small numbers (offset a bit)
+        ax.text(pos[0]*1.02, pos[1]*1.02, pos[2]*1.02, str(idx), fontsize=6, color='black')
+
+    # origin marker
+    ax.scatter([0.0], [0.0], [0.0], c='green', s=40, label='object center')
+
+    ax.set_title("Camera positions on a spherical spiral")
+    ax.set_xlabel("X axis"); ax.set_ylabel("Y axis"); ax.set_zlabel("Z axis")
+    ax.set_box_aspect([1,1,1])
+    desired_elev = 30   # Height
+    desired_azim = 160  # Angle
+    ax.view_init(elev=desired_elev, azim=desired_azim)
+    plt.tight_layout()
+    plt.savefig(Path(OUTDIR) / "camera_spiral.png", dpi=200)
+    plt.close()
+    print("Saved camera_positions.png for inspection.")
+except Exception as e:
+    print("Could not save camera positions plot:", e)
 
 
 # Create trainable voxel grid
-#rng = torch.manual_seed(0)
 voxel_grid = torch.nn.Parameter(torch.rand(1, 3, VOXEL_RES, VOXEL_RES, VOXEL_RES, device=DEVICE))
 optimizer = torch.optim.Adam([voxel_grid], lr=LR)
 
@@ -293,7 +403,7 @@ def world_to_grid_coords(pts):  # pts: [H,W,3] torch
 print("Start training...")
 
 scaler = torch.cuda.amp.GradScaler()
-ACCUM_STEPS = 1  # Anzahl der Views pro backward-step; 1 bedeutet direkt
+ACCUM_STEPS = 1  # views per backward-step
 
 for it in range(1, STEPS + 1):
     t0 = time.time()
@@ -301,20 +411,20 @@ for it in range(1, STEPS + 1):
     total_loss = 0.0
     total_pixels = 0
 
-    # Gradient Accumulation über Views
-    for vi, angle in enumerate(ANGLES):
+    # Gradient Accumulation over Views
+    for vi in range(len(mvps)):
         mvp = mvps[vi]
         ones = torch.ones_like(vertices[:, :, :1])
         vertices_h = torch.cat([vertices, ones], dim=-1)
         pos_clip = torch.matmul(vertices_h, mvp.transpose(1,2))
 
-        # --- Rasterizer float32 ---
+        # Rasterizer float32
         rast_out, rast_db = dr.rasterize(ctx, pos_clip.float(), faces_unbatched, resolution=[H, W])
         v_world_attr = vertices[0].float()
         pos_map, _ = dr.interpolate(v_world_attr, rast_out, faces_unbatched)
         pos_map = pos_map[0]
 
-        # --- Mixed Precision für Voxel-Sampling + Loss ---
+        # Mixed Precision for Voxel-sampling
         with torch.cuda.amp.autocast():
             grid = world_to_grid_coords(pos_map).unsqueeze(0).unsqueeze(0)
             sampled = F.grid_sample(voxel_grid, grid, mode='bilinear',
@@ -337,14 +447,12 @@ for it in range(1, STEPS + 1):
             total_loss += loss.item()
             total_pixels += num_valid
 
-        # Optional: Schritt ausführen nach N Views
         if (vi + 1) % ACCUM_STEPS == 0:
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
 
-    # Falls keine Accumulation nötig, abschließend Schritt
-    if len(ANGLES) % ACCUM_STEPS != 0:
+    if len(mvps) % ACCUM_STEPS != 0:
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
@@ -364,12 +472,12 @@ for it in range(1, STEPS + 1):
         print(f"Early stopping at iteration {it} (no improvement in {PATIENCE} steps)")
         break
 
-    # Save intermediates (unverändert, nur sicher, dass .float() benutzt wird)
+    # Save intermediates
     if it % SAVE_INTERVAL == 0 or it == 1 or it == STEPS:
         with torch.no_grad():
             step_out = Path(OUTDIR) / f"step_{it:06d}"
             step_out.mkdir(parents=True, exist_ok=True)
-            for vi, angle in enumerate(ANGLES):
+            for vi in range(len(mvps)):
                 mvp = mvps[vi]
                 ones = torch.ones_like(vertices[:, :, :1])
                 vertices_h = torch.cat([vertices, ones], dim=-1)
@@ -385,22 +493,22 @@ for it in range(1, STEPS + 1):
                 plt.imsave(str(step_out / f"pred_view{vi}.png"), pred_rgb)
                 plt.imsave(str(step_out / f"target_view{vi}.png"), np.clip(target_imgs[vi], 0.0, 1.0))
 
-            # ------------------- Ersatz: Voxel-Grid export -> Punktwolke (Welt-Koordinaten) -------------------
+            # Voxel-Grid export
             vg = voxel_grid.detach().cpu().numpy()[0]  # [3, D, H, W]
             np.save(str(step_out / "voxel_grid.npy"), vg)
 
-            # Occupancy als Norm der 3 Kanäle
+            # Occupancy as Norm of 3 Channels
             occ_values = np.linalg.norm(vg, axis=0)  # [D,H,W]
             maxval = float(occ_values.max()) if occ_values.size and occ_values.max() > 0 else 1.0
             occ_norm = occ_values / (maxval + 1e-12)
-            occ = occ_norm > 0.2  # threshold (kann angepasst werden)
+            occ = occ_norm > 0.2  # threshold
 
-            dz, hy, wx = np.nonzero(occ)  # indices in z,y,x order (je nach Konvention)
+            dz, hy, wx = np.nonzero(occ)  # indices in z,y,x order
             num_pts = len(dz)
             print(f"Found {num_pts} occupied voxels (threshold=0.2 after normalizing by max={maxval:.6g}).")
 
             if num_pts == 0:
-                print("Keine belegten Voxels gefunden – PLY wird nicht geschrieben.")
+                print("No occupied voxels found")
             else:
                 # Voxel indices -> world coordinates
                 # Indices: x = wx, y = hy, z = dz  (0..VOXEL_RES-1)
@@ -413,7 +521,7 @@ for it in range(1, STEPS + 1):
                 cy = (iy + 0.5) / float(VOXEL_RES)
                 cz = (iz + 0.5) / float(VOXEL_RES)
 
-                # bbox_min / bbox_max sind numpy arrays (wie oben berechnet)
+                # bbox_min / bbox_max as numpy arrays
                 # map normalized coords -> world coords
                 bbox_min_np = np.array(bbox_min, dtype=np.float32)
                 bbox_max_np = np.array(bbox_max, dtype=np.float32)
@@ -423,13 +531,13 @@ for it in range(1, STEPS + 1):
 
                 points = np.stack([world_x, world_y, world_z], axis=1)  # [N,3]
 
-                # Farben aus dem Voxelgrid (3 Kanäle)
+                # Colors out of Voxelgrid
                 cols = vg[:, dz, hy, wx].T  # [N,3]
-                # Clamp/normalisiere Farben: falls Werte außerhalb [0,1], clampte sie, sonst skaliere nicht
+                # Clamp/normalize colors
                 cols = np.clip(cols, 0.0, 1.0)
                 cols_u8 = (cols * 255.0).astype(np.uint8)
 
-                # Downsample falls zu groß (vermeidet riesige PLYs)
+                # Downsample
                 MAX_POINTS = 500000
                 if points.shape[0] > MAX_POINTS:
                     idxs = np.random.choice(points.shape[0], size=MAX_POINTS, replace=False)
@@ -451,8 +559,7 @@ for it in range(1, STEPS + 1):
                 print(f"Saved voxel cloud ({len(points)} points) → {ply_path}")
 
 
-# Analyse: Welche Voxels wurden von den Training Views getroffen?
-# print("Analysiere belegte Voxels aus den Trainings-Views...")
+# Analyse which voxels are hit by training views
 
 # affected_mask = torch.zeros((VOXEL_RES, VOXEL_RES, VOXEL_RES),
 #                             dtype=torch.bool, device=DEVICE)
@@ -481,7 +588,7 @@ for it in range(1, STEPS + 1):
 # print(f"Belegte Voxels: {num_affected} / {total_voxels} "
 #       f"({100.0*num_affected/total_voxels:.6f} %)")
 
-# # Export als PLY für Visualisierung
+# # Export as PLY
 # dz, hy, wx = torch.nonzero(affected_mask, as_tuple=True)
 # ply_path = Path(OUTDIR) / "affected_voxels.ply"
 # with open(ply_path, "w") as f:
@@ -496,7 +603,7 @@ for it in range(1, STEPS + 1):
 # print(f"Voxel-Occupancy als PLY gespeichert: {ply_path}")
 
 
-# Kamera-Positionen + Mesh visualisieren
+# Camera-positions + Mesh
 # camera_positions = []
 # camera_directions = []
 
@@ -521,15 +628,13 @@ for it in range(1, STEPS + 1):
 # fig = plt.figure(figsize=(6,6))
 # ax = fig.add_subplot(111, projection="3d")
 
-# # Mesh (leicht transparent, größere Punkte)
+# # Mesh transparent
 # ax.scatter(vertices_np[:,0], vertices_np[:,1], vertices_np[:,2],
 #            s=2, alpha=0.3, c="blue", label="Mesh")
 
-# # Farbenliste für Kameras
 # colors = ["red", "green", "blue"]
 # used_labels = set()
 
-# # Kamera-Positionen + Richtungen mit wechselnden Farben
 # for i, (pos, dir_vec) in enumerate(zip(camera_positions, camera_directions)):
 #     col = colors[i % len(colors)]
 #     label = "Cameras" if col not in used_labels else None
@@ -539,7 +644,6 @@ for it in range(1, STEPS + 1):
 #               length=1.0, normalize=True, color=col)
 #     used_labels.add(col)
 
-# # Einheitliche Achsenskalierung
 # ax.set_box_aspect([1,1,1])
 
 # ax.set_title("Target Cameras + Mesh")
@@ -556,7 +660,7 @@ print("Training finished. Final voxel grid saved to", OUTDIR)
 
 
 # Novel View Synthesis
-novel_angles = [160]
+novel_angles = [160, 240]
 print(f"Rendering {len(novel_angles)} novel views...")
 
 with torch.no_grad():
@@ -564,13 +668,13 @@ with torch.no_grad():
     novel_out.mkdir(parents=True, exist_ok=True)
 
     for angle in novel_angles:
-        # Neue MVP-Matrix für diesen Winkel
+        # New MVP-Matrix
         mvp = get_mvp_matrix(angle, H, W, DEVICE)
         ones = torch.ones_like(vertices[:, :, :1])
         vertices_h = torch.cat([vertices, ones], dim=-1)
         pos_clip = torch.matmul(vertices_h, mvp.transpose(1, 2))
 
-        # Rasterize + Weltkoordinaten
+        # Rasterize + world coordinates
         rast_out, _ = dr.rasterize(ctx, pos_clip.float(), faces_unbatched, resolution=[H, W])
         pos_map, _ = dr.interpolate(vertices[0].float(), rast_out, faces_unbatched)
         pos_map = pos_map[0]
@@ -583,7 +687,7 @@ with torch.no_grad():
         pred_rgb = sampled.squeeze(2).permute(0, 2, 3, 1)[0].cpu().numpy()
         pred_rgb = np.clip(pred_rgb, 0.0, 1.0)
 
-        # Bild speichern
+        # Save image
         out_path = novel_out / f"novel_angle{angle}.png"
         plt.imsave(str(out_path), pred_rgb)
         print(f"Saved novel view at angle {angle}° → {out_path}")
@@ -626,7 +730,7 @@ print("Novel view synthesis complete.")
 #     pts_all = np.concatenate(points_list, axis=0)
 #     cols_all = np.concatenate(colors_list, axis=0)
 
-#     # --- save as .ply for external visualization (Meshlab / CloudCompare) ---
+#     # Save as .ply
 #     ply_path = vis_out / "unprojected_points.ply"
 #     with open(ply_path, "w") as f:
 #         f.write("ply\nformat ascii 1.0\n")
@@ -640,7 +744,7 @@ print("Novel view synthesis complete.")
 #             f.write(f"{x} {y} {z} {r} {g} {b}\n")
 #     print(f"Saved unprojected pointcloud .ply -> {ply_path}")
 
-# # --- Analyse: Train vs Target Coverage ---
+# # Train vs Target Coverage
 # print("Vergleiche Trainings- und Target-Views für Voxel-Coverage...")
 
 # def compute_affected_mask(angles, mvps):
@@ -662,15 +766,14 @@ print("Novel view synthesis complete.")
 #         mask[idx[:,0], idx[:,1], idx[:,2]] = True
 #     return mask
 
-# # Train- und Target-Masken berechnen
+# # Train- and Target-Masks
 # train_mask = compute_affected_mask(ANGLES, mvps)
 
-# # Target-Views separat definieren (z. B. Novel Angles!)
-# novel_angles = [160]  # oder mehrere Novel-Angles
+# novel_angles = [160]
 # novel_mvps = [get_mvp_matrix(a, H, W, DEVICE) for a in novel_angles]
 # target_mask = compute_affected_mask(novel_angles, novel_mvps)
 
-# # Unterschiede
+# # Difference
 # only_train = train_mask & ~target_mask
 # only_target = target_mask & ~train_mask
 # both = train_mask & target_mask
@@ -679,7 +782,7 @@ print("Novel view synthesis complete.")
 # print("Nur Target:", only_target.sum().item())
 # print("Beide:", both.sum().item())
 
-# # --- Export PLY ---
+# # Export PLY
 # dz, hy, wx = torch.nonzero(train_mask | target_mask, as_tuple=True)
 
 # ply_path = Path(OUTDIR) / "train_vs_target_voxels.ply"
