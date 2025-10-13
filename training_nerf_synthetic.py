@@ -19,18 +19,16 @@ parser.add_argument("--mesh", type=str, default=None, help="(optional) Path to G
 parser.add_argument("--data_root", type=str, default=None, help="Path to NeRF-Synthetic scene folder (transforms_*.json + images).")
 parser.add_argument("--outdir", type=str, default="train_out", help="Output directory")
 parser.add_argument("--voxel_res", type=int, default=256, help="Voxel grid resolution (D,H,W)")
-parser.add_argument("--img_res", type=int, default=128, help="Image resolution (H and W)")
+parser.add_argument("--img_res", type=int, default=512, help="Image resolution (H and W)")
 parser.add_argument("--steps", type=int, default=1000, help="Training iterations")
 parser.add_argument("--lr", type=float, default=1e-2, help="Learning rate")
 parser.add_argument("--save_interval", type=int, default=100, help="Save image/checkpoint every N steps")
-parser.add_argument("--early_stop_patience", type=int, default=200, help="Stop training if no improvement in N steps")
+parser.add_argument("--early_stop_patience", type=int, default=50, help="Stop training if no improvement in N steps")
 parser.add_argument("--early_stop_delta", type=float, default=1e-6, help="Minimum change to consider an improvement")
 parser.add_argument("--bbox_size", type=float, default=2.0, help="Scene bounding box (cube side length) used when no mesh provided")
 parser.add_argument("--n_samples", type=int, default=64, help="Samples per ray for volumetric rendering (dataset-only)")
 parser.add_argument("--near", type=float, default=0.1, help="Near plane for ray sampling")
 parser.add_argument("--far", type=float, default=6.0, help="Far plane for ray sampling")
-parser.add_argument("--normalize_mesh", action="store_true", help="If set, normalize/center/scale mesh on load")
-parser.add_argument("--apply_pose_flip", action="store_true", help="If set, apply a diag(1,-1,-1,1) flip to dataset poses (Blender→neRF)")
 args = parser.parse_args()
 
 MESH_PATH = args.mesh
@@ -48,8 +46,6 @@ BBOX_SIZE = args.bbox_size
 N_SAMPLES = args.n_samples
 NEAR = args.near
 FAR = args.far
-NORMALIZE_MESH = args.normalize_mesh
-APPLY_POSE_FLIP = args.apply_pose_flip
 
 os.makedirs(OUTDIR, exist_ok=True)
 tb_writer = SummaryWriter(log_dir=os.path.join(OUTDIR, "tensorboard"))
@@ -58,127 +54,131 @@ print(f"[INFO] Device: {DEVICE}")
 
 # ---------------- helpers ----------------
 def look_at(eye, center, up):
-    f = center - eye
-    f = f / np.linalg.norm(f)
-    s = np.cross(f, up)
-    s = s / np.linalg.norm(s)
-    u = np.cross(s, f)
+    f = center - eye    # View direction
+    f = f / np.linalg.norm(f)   # Normalization
+    s = np.cross(f, up) # Right-vector (Cross product)
+    s = s / np.linalg.norm(s)   # Normalization
+    u = np.cross(s, f)  # Recompute up-vector
     m = np.eye(4, dtype=np.float32)
-    m[0, :3] = s
-    m[1, :3] = u
-    m[2, :3] = -f
-    m[:3, 3] = -m[:3, :3] @ eye
+    m[0, :3] = s    # x-axis
+    m[1, :3] = u    # y-axis
+    m[2, :3] = -f   # z-axis
+    m[:3, 3] = -m[:3, :3] @ eye # Translation (4x4 view-matrix)
     return m
 
 def perspective(fovy, aspect, near, far):
-    f = 1.0 / np.tan(fovy / 2.0)
+    f = 1.0 / np.tan(fovy / 2.0)    # Scaling factor for FoV
     m = np.zeros((4, 4), dtype=np.float32)
     m[0, 0] = f / aspect
-    m[1, 1] = -f
+    m[1, 1] = -f    # y-flip
     m[2, 2] = (far + near) / (near - far)
     m[2, 3] = (2 * far * near) / (near - far)
     m[3, 2] = -1.0
-    return m
+    return m    # projection matrix (3D to 2D)
 
 def mvp_from_cam(cam2world, H, W, focal, near=0.1, far=10.0):
-    # view = inverse(cam2world)
-    view = np.linalg.inv(cam2world).astype(np.float32)
-    fovy = 2.0 * np.arctan(float(H) / (2.0 * float(focal)))
-    proj = perspective(fovy, float(W) / float(H), near, far)
-    return proj @ view
+    view = np.linalg.inv(cam2world).astype(np.float32)  # view-matrix as inverse of cam2world
+    fovy = 2.0 * np.arctan(float(H) / (2.0 * float(focal))) # FoV
+    proj = perspective(fovy, float(W) / float(H), near, far)    # projection matrix
+    return proj @ view  # multiply to get transformation matrix (world -> clip space)
 
 # ---------------- Dataset loader (NeRF-Synthetic) ----------------
-class NeRFSyntheticDataset(torch.utils.data.Dataset):
-    def __init__(self, root, split="train", img_wh=(128,128)):
-        self.root = root
-        self.split = split
-        self.W, self.H = img_wh
-        json_path = os.path.join(root, f"transforms_{split}.json")
-        if not os.path.exists(json_path):
-            raise FileNotFoundError(f"Expected {json_path}")
-        with open(json_path, "r") as f:
-            self.meta = json.load(f)
+# class NeRFSyntheticDataset(torch.utils.data.Dataset):
+#     def __init__(self, root, split="train", img_wh=(128,128)):
+#         self.root = root
+#         self.split = split
+#         self.W, self.H = img_wh
+#         json_path = os.path.join(root, f"transforms_{split}.json")
+#         if not os.path.exists(json_path):
+#             raise FileNotFoundError(f"Expected {json_path}")
+#         with open(json_path, "r") as f:
+#             self.meta = json.load(f)
 
-        self.image_paths = []
-        self.poses = []
-        for frame in self.meta["frames"]:
-            p = os.path.join(root, frame["file_path"] + ".png")
-            if not os.path.exists(p):
-                p_jpg = p.replace(".png", ".jpg")
-                if os.path.exists(p_jpg):
-                    p = p_jpg
-                else:
-                    raise FileNotFoundError(f"Image not found: {p}")
-            self.image_paths.append(p)
-            self.poses.append(np.array(frame["transform_matrix"], dtype=np.float32))
-        self.poses = np.stack(self.poses, axis=0)
-        # focal from camera_angle_x
-        self.focal = 0.5 * self.W / np.tan(0.5 * float(self.meta["camera_angle_x"]))
+#         self.image_paths = []
+#         self.poses = []
+#         for frame in self.meta["frames"]:
+#             p = os.path.join(root, frame["file_path"] + ".png")
+#             if not os.path.exists(p):
+#                 p_jpg = p.replace(".png", ".jpg")
+#                 if os.path.exists(p_jpg):
+#                     p = p_jpg
+#                 else:
+#                     raise FileNotFoundError(f"Image not found: {p}")
+#             self.image_paths.append(p)
+#             self.poses.append(np.array(frame["transform_matrix"], dtype=np.float32))
+#         self.poses = np.stack(self.poses, axis=0)
+#         # focal from camera_angle_x
+#         self.focal = 0.5 * self.W / np.tan(0.5 * float(self.meta["camera_angle_x"]))
 
-    def __len__(self):
-        return len(self.image_paths)
+#     def __len__(self):
+#         return len(self.image_paths)
 
-    def __getitem__(self, idx):
-        pil = Image.open(self.image_paths[idx])
-        pil_rgba = pil.convert("RGBA")
-        if (pil_rgba.width, pil_rgba.height) != (self.W, self.H):
-            pil_rgba = pil_rgba.resize((self.W, self.H), resample=Image.LANCZOS)
-        arr = np.array(pil_rgba)  # [H,W,4]
-        if arr.ndim == 2:
-            arr = np.stack([arr]*4, axis=-1)
-        alpha = arr[..., 3] / 255.0
-        rgb = arr[..., :3]
-        a = alpha[..., None].astype(np.float32)
-        img = (rgb.astype(np.float32) / 255.0) * a + (1.0 - a)
-        mask = alpha.astype(np.float32)
-        pose = self.poses[idx]
-        return {
-            "img": torch.from_numpy(img).permute(2,0,1),  # [3,H,W]
-            "mask": torch.from_numpy(mask),               # [H,W]
-            "pose": torch.from_numpy(pose),               # [4,4]
-            "focal": torch.tensor(self.focal, dtype=torch.float32),
-            "path": self.image_paths[idx]
-        }
+#     def __getitem__(self, idx):
+#         pil = Image.open(self.image_paths[idx])
+#         pil_rgba = pil.convert("RGBA")
+#         if (pil_rgba.width, pil_rgba.height) != (self.W, self.H):
+#             pil_rgba = pil_rgba.resize((self.W, self.H), resample=Image.LANCZOS)
+#         arr = np.array(pil_rgba)  # [H,W,4]
+#         if arr.ndim == 2:
+#             arr = np.stack([arr]*4, axis=-1)
+#         alpha = arr[..., 3] / 255.0
+#         rgb = arr[..., :3]
+#         a = alpha[..., None].astype(np.float32)
+#         img = (rgb.astype(np.float32) / 255.0) * a + (1.0 - a)
+#         mask = alpha.astype(np.float32)
+#         pose = self.poses[idx]
+#         return {
+#             "img": torch.from_numpy(img).permute(2,0,1),  # [3,H,W]
+#             "mask": torch.from_numpy(mask),               # [H,W]
+#             "pose": torch.from_numpy(pose),               # [4,4]
+#             "focal": torch.tensor(self.focal, dtype=torch.float32),
+#             "path": self.image_paths[idx]
+#         }
 
 # ---------------- Rays + volumetric renderer (dataset-only) ----------------
 def get_rays_from_pose(cam2world, focal, H, W, device):
+    # Make sure cam2world is a float tensor on device (Convert if not)
     if isinstance(cam2world, np.ndarray):
         cam2world = torch.from_numpy(cam2world).to(device=device, dtype=torch.float32)
     else:
         cam2world = cam2world.to(device=device, dtype=torch.float32)
 
+    # Create arrays for pixels, sampling pixel center
     i = (torch.arange(0, W, device=device).float() + 0.5)
     j = (torch.arange(0, H, device=device).float() + 0.5)
+    # Create (H,W)-grid with pixel arrays
     try:
         px, py = torch.meshgrid(i, j, indexing='xy')
     except TypeError:
         px, py = torch.meshgrid(i, j)
         px = px.t(); py = py.t()
 
-    cx = W * 0.5
-    cy = H * 0.5
-    x_cam = (px - cx) / focal
-    y_cam = -(py - cy) / focal
-    z_cam = torch.ones_like(x_cam)
+    cx = W * 0.5    # Center coordinate
+    cy = H * 0.5    # Center coordinate
+    # Cam coordinates of pixel ray
+    x_cam = (px - cx) / focal   # Project pixel in image plane
+    y_cam = -(py - cy) / focal  # Project pixel in image plane
+    z_cam = torch.ones_like(x_cam)  # Set image plane at z=1 in camera coordinates
 
-    dirs_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)  # [H,W,3]
-    R = cam2world[:3, :3]
-    t = cam2world[:3, 3]
+    dirs_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)  # Create 3D direction vector for every pixel [H,W,3]
+    R = cam2world[:3, :3]   # Rotation matrix (camera->world rotation)
+    t = cam2world[:3, 3]    # Translation vector (camera position -> world coordinate)
 
-    dirs_world = dirs_cam.reshape(-1, 3) @ R.t()
+    dirs_world = dirs_cam.reshape(-1, 3) @ R.t()    # Flatten and transform to world coordinates
     dirs_world = dirs_world.reshape(H, W, 3)
-    dirs_world = dirs_world / (torch.norm(dirs_world, dim=-1, keepdim=True) + 1e-12)
-    origin = t.view(1,1,3).expand(H, W, 3)
+    dirs_world = dirs_world / (torch.norm(dirs_world, dim=-1, keepdim=True) + 1e-12)    # Normalization of directions
+    origin = t.view(1,1,3).expand(H, W, 3)  # Camera position expanded to [H,W,3] tensor
     return origin, dirs_world
 
 # world->grid mapping will be filled later depending on mesh or bbox
-bbox_min_t = None
-bbox_max_t = None
+bbox_min_t = None   # Bounding box borders
+bbox_max_t = None   # Bounding box borders
 def world_to_grid_coords(pts):
+
     # pts: [...,3] in world coords (torch)
-    global bbox_min_t, bbox_max_t
-    norm = (pts - bbox_min_t) / (bbox_max_t - bbox_min_t + 1e-8)
-    grid = norm * 2.0 - 1.0
+    global bbox_min_t, bbox_max_t   # get borders
+    norm = (pts - bbox_min_t) / (bbox_max_t - bbox_min_t + 1e-8)    # min-max norm to [0, 1]
+    grid = norm * 2.0 - 1.0 # scale to [-1, 1]
     return grid
 
 def render_rays_from_voxelgrid(voxel_grid, cam2world, focal, H, W, N_samples=64, near=0.1, far=6.0, device='cuda'):
@@ -211,20 +211,15 @@ def render_rays_from_voxelgrid(voxel_grid, cam2world, focal, H, W, N_samples=64,
 def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
                                   vertices, faces_unbatched, ctx, voxel_sample_mode='bilinear',
                                   near=0.1, far=10.0, device='cuda'):
-    """
-    Rasterize the mesh from the given cam2world + focal, interpolate world positions,
-    convert them to voxel grid coordinates and sample voxel_grid to get RGB per-pixel.
-    Returns a torch tensor [H,W,3] (float32, on device).
-    """
-    # build MVP like in other places
+    # Create MVP (view-projection matrix) for rasterizing
     mvp_np = mvp_from_cam(cam2world_np, H, W, focal, near=near, far=far)  # numpy 4x4
     mvp = torch.tensor(mvp_np, dtype=torch.float32, device=device).unsqueeze(0)  # [1,4,4]
 
-    # prepare vertices (batched [1,V,3]) and ones for homogeneous multiply
+    # Convert vertices (batched [1,V,3]) to [1,V,4] for homogeneous multiply
     ones = torch.ones_like(vertices[:, :, :1])
     verts_h = torch.cat([vertices, ones], dim=-1)  # [1,V,4]
 
-    # pos_clip: multiply with mvp (transpose to match shapes)
+    # pos_clip: multiply vertices with mvp (transpose to match shapes, vertices in clip-space)
     pos_clip = torch.matmul(verts_h, mvp.transpose(1, 2))  # [1,V,4]
 
     # rasterize -> rast_out
@@ -242,16 +237,16 @@ def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
     # sample/query voxel grid: voxel_grid_param is [1,C,D,H,W]
     sampled = F.grid_sample(voxel_grid_param, grid_for_sample, mode=voxel_sample_mode,
                             padding_mode='border', align_corners=True)  # [1,C,1,H,W]
-    # reorder to [1,1,H,W,C]
+    # Reorder and squeeze dimensions
     sampled = sampled.permute(0, 2, 3, 4, 1)  # [1,1,H,W,C]
     sampled = sampled.squeeze(1)  # [1,H,W,C]
     sampled = sampled[0]  # [H,W,C]
 
-    # If voxel grid stores colors in first 3 channels, pick them. Else adapt accordingly.
-    pred_rgb = sampled[..., :3]  # [H,W,3], torch tensor on device
+    # Pick first 3 channels of voxel grid as RGB
+    pred_rgb = sampled[..., :3]  # [H,W,3]
 
-    # Set background to black
-    mask = rast_out[0, ..., 3] > 0
+    # Set background to white
+    mask = rast_out[0, ..., 3] > 0  # Pixels hit by rasterization
     pred_rgb[~mask] = 1.0
     return pred_rgb
 
@@ -265,24 +260,22 @@ dataset_cam2worlds = []
 dataset_focal = None
 
 if DATA_ROOT is not None:
+    # Open and validate transforms_train.json
     json_path = os.path.join(DATA_ROOT, "transforms_train.json")
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"Dataset transforms_train.json not found at {json_path}")
     meta = json.load(open(json_path, "r"))
-    frames = meta.get("frames", [])
+    frames = meta.get("frames", []) # Load frames into list
     if len(frames) == 0:
         raise ValueError("transforms_train.json contains 0 frames")
     use_dataset = True
-    dataset_focal = 0.5 * IMG_RES / np.tan(0.5 * float(meta["camera_angle_x"]))
+    dataset_focal = 0.5 * IMG_RES / np.tan(0.5 * float(meta["camera_angle_x"])) # Calculate FoV
     print(f"[INFO] Dataset found: {len(frames)} frames, focal(derived) = {dataset_focal:.3f}")
-    # flip matrix for optional blender->nerf conversion (right-multiply)
-    flip = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+
     for fr in frames:
-        cam2world = np.array(fr["transform_matrix"], dtype=np.float32)
-        if APPLY_POSE_FLIP:
-            cam2world = cam2world @ flip
-        dataset_cam2worlds.append(cam2world)
-        # load image (RGBA), resize to IMG_RES
+        cam2world = np.array(fr["transform_matrix"], dtype=np.float32)  # Read transform_matrix
+        dataset_cam2worlds.append(cam2world)    # Append camera->world matrices to list
+        # Load image
         img_path = os.path.join(DATA_ROOT, fr["file_path"] + ".png")
         if not os.path.exists(img_path):
             alt = img_path.replace(".png", ".jpg")
@@ -290,22 +283,20 @@ if DATA_ROOT is not None:
                 img_path = alt
             else:
                 raise FileNotFoundError(f"Image not found: {img_path}")
-        pil = Image.open(img_path).convert("RGBA")
+        pil = Image.open(img_path).convert("RGBA")  # Open image and convert to RGBA
         if pil.size != (IMG_RES, IMG_RES):
-            pil = pil.resize((IMG_RES, IMG_RES), resample=Image.LANCZOS)
-        arr = np.array(pil).astype(np.float32)
+            pil = pil.resize((IMG_RES, IMG_RES), resample=Image.LANCZOS)    # Resize image
+        arr = np.array(pil).astype(np.float32)  # Save in array [IMG_RES,IMG_RES,4]
 
-        # Alpha in [0,1]
-        alpha = arr[..., 3] / 255.0
+        alpha = arr[..., 3] / 255.0 # Alpha normalized to [0,1]
 
         # Premultiply: RGB * alpha
-        a = alpha[..., None].astype(np.float32)            # alpha in [0,1]
-        rgb = (arr[..., :3] / 255.0).astype(np.float32) * a + (1.0 - a)
+        a = alpha[..., None].astype(np.float32)            # Alpha in [0,1]
+        rgb = (arr[..., :3] / 255.0).astype(np.float32) * a + (1.0 - a) # alpha-blending
 
-        # Mask
-        mask = alpha.astype(np.float32)
-        dataset_target_imgs.append(rgb.astype(np.float32))
-        dataset_target_masks.append(mask.astype(np.float32))
+        mask = alpha.astype(np.float32) # Alpha mask in [0,1]
+        dataset_target_imgs.append(rgb.astype(np.float32))  # Save images to list
+        dataset_target_masks.append(mask.astype(np.float32))    # Save masks to list
 
 # ---------------- If mesh is provided: load and prepare rasterization targets ----------------
 mesh = None
@@ -316,8 +307,8 @@ use_mesh = False
 
 if MESH_PATH is not None:
     import trimesh
-    loaded = trimesh.load(MESH_PATH, process=True)
-    if isinstance(loaded, trimesh.Scene):
+    loaded = trimesh.load(MESH_PATH, process=True)  # Load mesh
+    if isinstance(loaded, trimesh.Scene):   # If Scene, try to create single trimesh
         try:
             mesh = loaded.dump(concatenate=True)
             if not isinstance(mesh, trimesh.Trimesh):
@@ -330,24 +321,16 @@ if MESH_PATH is not None:
     else:
         mesh = loaded
 
-    if not isinstance(mesh, trimesh.Trimesh):
+    if not isinstance(mesh, trimesh.Trimesh):   # Make sure mesh is a trimesh
         raise TypeError("Expected trimesh.Trimesh")
 
-    # optionally normalize mesh
-    mesh_vertices = mesh.vertices.astype(np.float32)
-    #mesh_vertices[:, 1] *= -1.0
-    if NORMALIZE_MESH:
-        mesh_vertices -= mesh_vertices.mean(axis=0)
-        mesh_vertices /= (np.max(np.linalg.norm(mesh_vertices, axis=1)))
-        #mesh_vertices *= 2.0
-        #mesh_vertices[:, 1] *= -1.0
-        print("[INFO] Mesh normalized (centered/scaled/y-flip).")
+    mesh_vertices = mesh.vertices.astype(np.float32)    # Convert to float32
     mesh.vertices = mesh_vertices
 
     r = np.array([[1, 0, 0],
               [0, 0,-1],
               [0, 1, 0]])
-    mesh.vertices = mesh.vertices @ r.T
+    mesh.vertices = mesh.vertices @ r.T # Rotate coordinates with rotation matrix
 
     # prepare visuals: vertex colors or texture or fallback
     use_vertex_colors = False
@@ -411,24 +394,24 @@ if MESH_PATH is not None:
         print("[INFO] Using fallback position-based vertex colors for mesh.")
 
     # prepare tensors for rasterizer
-    vertices_np = mesh.vertices.astype(np.float32)
-    faces_np = mesh.faces.astype(np.int32)
+    vertices_np = mesh.vertices.astype(np.float32)  # Get vertex positions of mesh
+    faces_np = mesh.faces.astype(np.int32)  # Get vertex triangle indices
     vertices = torch.tensor(vertices_np, device=DEVICE).unsqueeze(0)  # [1,V,3]
     faces = torch.tensor(faces_np, device=DEVICE).unsqueeze(0)        # [1,F,3]
-    faces_unbatched = faces[0].contiguous()
+    faces_unbatched = faces[0].contiguous() # Remove batch dimension [F,3]
 
     # compute bbox from mesh (world->grid mapping)
-    bbox_min = vertices[0].min(dim=0)[0].cpu().numpy() - 1e-4
-    bbox_max = vertices[0].max(dim=0)[0].cpu().numpy() + 1e-4
+    bbox_min = vertices[0].min(dim=0)[0].cpu().numpy() - 1e-4   # Calculate min for all vertices
+    bbox_max = vertices[0].max(dim=0)[0].cpu().numpy() + 1e-4   # Calculate max for all vertices
     bbox_min = bbox_min.astype(np.float32); bbox_max = bbox_max.astype(np.float32)
-    bbox_min_t = torch.tensor(bbox_min, dtype=torch.float32, device=DEVICE)
+    bbox_min_t = torch.tensor(bbox_min, dtype=torch.float32, device=DEVICE) # Convert to tensors
     bbox_max_t = torch.tensor(bbox_max, dtype=torch.float32, device=DEVICE)
 
     print(f"[DEBUG] Mesh bbox_min: {bbox_min}, bbox_max: {bbox_max}")
 
     # rasterize targets: if dataset provided, use dataset poses, else generate views by angles
-    ctx = dr.RasterizeCudaContext()
-    H = IMG_RES; W = IMG_RES
+    ctx = dr.RasterizeCudaContext() # Create nvdiffrast CUDA-Rasterizer-Context
+    H = IMG_RES; W = IMG_RES    # Set resolution
 
     if use_dataset:
         # create mvp per dataset pose (from dataset_cam2worlds + dataset_focal)
@@ -439,28 +422,27 @@ if MESH_PATH is not None:
         # rasterize mesh using these mvps -> form target_imgs/masks for mesh-based training
         for mvp in mvps:
             ones = torch.ones_like(vertices[:, :, :1])
-            pos_clip = torch.matmul(torch.cat([vertices, ones], dim=-1), mvp.transpose(1,2))
-            rast_out, _ = dr.rasterize(ctx, pos_clip, faces_unbatched, resolution=[H, W])
+            pos_clip = torch.matmul(torch.cat([vertices, ones], dim=-1), mvp.transpose(1,2))    # [1,V,4]
+            rast_out, _ = dr.rasterize(ctx, pos_clip, faces_unbatched, resolution=[H, W])   # [1,H,W,4+]
             if use_vertex_colors:
                 rgb_t, _ = dr.interpolate(vcol_tensor, rast_out, faces_unbatched)
-                rgb_t = rgb_t[0].cpu().numpy()
+                rgb_t = rgb_t[0].cpu().numpy()  # [H,W,3]
             elif use_texture:
                 uv_map, _ = dr.interpolate(uv_attr, rast_out, faces_unbatched)
-                uv_grid = uv_map * 2.0 - 1.0
+                uv_grid = uv_map * 2.0 - 1.0    # Scale to [-1, 1]
                 uv_grid = uv_grid.to(dtype=torch.float32, device=texture_tensor.device)
                 tex_sampled = F.grid_sample(texture_tensor, uv_grid, mode="bilinear", align_corners=True)
                 rgb_t = tex_sampled.permute(0,2,3,1)[0].detach().cpu().numpy()
             else:
-                rgb_t = np.ones((H, W, 3), dtype=np.float32)
-            mask = (rast_out[0, ..., 3] > 0).cpu().numpy()
-            # ensure background = white where mask==False
-            if mask.ndim == 2:
+                rgb_t = np.ones((H, W, 3), dtype=np.float32)    # Fallback: all pixel white
+            mask = (rast_out[0, ..., 3] > 0).cpu().numpy()  # Extract mask out of rasterization
+            if mask.ndim == 2:  # ensure background = white where mask==False
                 rgb_t[~mask] = 1.0
             else:
                 #fallback
                 rgb_t[mask == False] = 1.0
-            target_imgs.append(rgb_t.astype(np.float32))
-            target_masks.append(mask.astype(np.bool_))
+            target_imgs.append(rgb_t.astype(np.float32))    # Save target image [H,W,3]
+            target_masks.append(mask.astype(np.bool_))  # Save target mask [H,W]
         print("[INFO] Mesh rasterized for dataset poses (targets ready).")
     else:
         # no dataset: generate a few angular views and rasterize mesh for targets (fallback)
@@ -506,12 +488,6 @@ else:
     print(f"[DEBUG] Dataset-only bbox_min: {bbox_min}, bbox_max: {bbox_max}")
 
     print(f"[INFO] No mesh provided. Using centered bbox size {BBOX_SIZE}. Dataset-only volumetric mode.")
-
-# If dataset is present but we didn't rasterize mesh, prepare dataset lists for training
-if use_dataset and not use_mesh:
-    # dataset_target_imgs/masks already loaded earlier
-    # create dummy mvps list only for bookkeeping (we will use cam2worlds instead in volumetric render)
-    pass
 
 # Sanity-check: if both mesh and dataset present render mesh from first dataset pose and compare
 # if use_mesh and use_dataset:
@@ -657,7 +633,7 @@ if use_dataset and not use_mesh:
 #     except Exception as e:
 #         print("[Extra visualization] skipped due to error:", e)
 
-# Prepare voxel grid + optimizer
+# Prepare voxel grid + optimizer + loss
 voxel_grid = torch.nn.Parameter(torch.rand(1, 3, VOXEL_RES, VOXEL_RES, VOXEL_RES, device=DEVICE))
 optimizer = torch.optim.Adam([voxel_grid], lr=LR)
 best_loss = float('inf'); no_improve_steps = 0
@@ -679,35 +655,34 @@ best_loss = float('inf'); no_improve_steps = 0
 #         print("[PREVIEW] Saved init_pred.png and init_target.png")
 
 print("[TRAIN] Start training...")
-scaler = torch.cuda.amp.GradScaler()
-ACCUM_STEPS = 1
+scaler = torch.cuda.amp.GradScaler()    # Initialize GradScaler for AMP
 
 # Training loop:
 for it in range(1, STEPS+1):
     t0 = time.time()
-    optimizer.zero_grad()
+    optimizer.zero_grad()   # Reset gradients before backprop
     total_mse_sum = torch.tensor(0.0, device=DEVICE)   # sum of squared errors (over all valid scalar entries)
-    total_num_entries = 0.0
+    total_num_entries = 0.0 # counter 
 
-    if use_mesh:
-        for vi, cam2world in enumerate(dataset_cam2worlds):
+    if use_dataset:
+        for vi, cam2world in enumerate(dataset_cam2worlds): # iterate over all dataset poses
             cam2world_t = torch.from_numpy(cam2world).to(device=DEVICE, dtype=torch.float32)
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(): # AMP for memory saving
                 cam2world_np = cam2world_t.cpu().numpy()
                 pred_map = render_via_mesh_rasterization(voxel_grid, cam2world_np, float(dataset_focal),
                                                         IMG_RES, IMG_RES, vertices, faces_unbatched, ctx,
                                                         voxel_sample_mode='bilinear', near=NEAR, far=FAR, device=DEVICE)
                 # pred_map: torch tensor [H,W,3] on device
-                tgt = torch.tensor(dataset_target_imgs[vi], dtype=torch.float32, device=DEVICE)
+                tgt = torch.tensor(dataset_target_imgs[vi], dtype=torch.float32, device=DEVICE) # target image
 
-                mse_sum = ((pred_map - tgt) ** 2).sum()
-                entries = float(pred_map.numel())
+                mse_sum = ((pred_map - tgt) ** 2).sum() # calculate MSE
+                entries = float(pred_map.numel())   # H * W * 3
 
-                total_mse_sum = total_mse_sum + mse_sum
-                total_num_entries += entries
+                total_mse_sum = total_mse_sum + mse_sum # add mse to total
+                total_num_entries += entries    # add entries to total
 
     else:
-        # Dataset-only volumetric training: render rays and compare to dataset images
+        # Used when only mesh is given
         for vi, cam2world in enumerate(dataset_cam2worlds):
             cam2world_t = torch.from_numpy(cam2world).to(device=DEVICE, dtype=torch.float32)
             focal = float(dataset_focal)
@@ -722,27 +697,22 @@ for it in range(1, STEPS+1):
                 total_mse_sum = total_mse_sum + mse_sum
                 total_num_entries += entries
 
-    if total_num_entries == 0.0:
+    if total_num_entries == 0.0:    # Skip iteration if no valid pixels
         print(f"[WARN] Iter {it}: total_num_entries == 0 -> skipping backward step.")
         continue
 
     mean_loss = total_mse_sum / float(total_num_entries)   # tensor on DEVICE
 
-    loss = mean_loss / ACCUM_STEPS
+    scaler.scale(mean_loss).backward()   # backpropagation
+    scaler.step(optimizer)  # parameter update
+    scaler.update() # update AMP scaling
+    optimizer.zero_grad()   # Reset gradients
 
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
-    optimizer.zero_grad()
-    
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
+    total_loss = mean_loss.item()
 
-    total_loss = loss.item()
-
-    tb_writer.add_scalar("Loss/train", total_loss, it)
+    tb_writer.add_scalar("Loss/train", total_loss, it)  # Write loss to tensorboard
     t1 = time.time()
-    if it % 10 == 0 or it == 1:
+    if it % 10 == 0 or it == 1: # Print Loss for every 10 steps
         print(f"Iter {it}/{STEPS} loss={total_loss:.6f} time={t1-t0:.3f}s")
 
     # early stopping
@@ -757,26 +727,24 @@ for it in range(1, STEPS+1):
 
     # Save intermediates
     if it % SAVE_INTERVAL == 0 or it == 1 or it == STEPS:
-        with torch.no_grad():
-            step_out = Path(OUTDIR) / f"step_{it:06d}"
+        with torch.no_grad():   # Deactivate Autograd
+            step_out = Path(OUTDIR) / f"step_{it:06d}"  # Directory for steps
             step_out.mkdir(parents=True, exist_ok=True)
 
-            # save previews: for mesh-mode use target_imgs, for dataset-mode use dataset images
-            n_preview = min(50, len(dataset_target_imgs))
+            n_preview = min(50, len(dataset_target_imgs))   # Set number of images
             for vi in range(n_preview):
                 cam2world_np = dataset_cam2worlds[vi]      # numpy (4x4)
                 focal_to_use = float(dataset_focal)
-
+                # render predicted views
                 pred_map = render_via_mesh_rasterization(
                     voxel_grid, cam2world_np, focal_to_use, IMG_RES, IMG_RES,
                     vertices, faces_unbatched, ctx,
                     voxel_sample_mode='bilinear', near=NEAR, far=FAR, device=DEVICE
                 )  # returns torch Tensor [H,W,3] on DEVICE
 
-                pm = pred_map.detach().cpu().numpy()
-                #print(f"[PREVIEW] step={it} view={vi} pred_map min/max/mean = {pm.min():.6f}/{pm.max():.6f}/{pm.mean():.6f}")
-                pred_rgb = np.clip(pm, 0.0, 1.0)
-                # Overlay step-count
+                pm = pred_map.detach().cpu().numpy()    # copy to cpu
+                pred_rgb = np.clip(pm, 0.0, 1.0)    # [0, 1]
+                # Overlay step-count onto image
                 try:
                     # Convert float [0,1] -> uint8
                     pred_u8 = (pred_rgb * 255.0).astype(np.uint8)
@@ -793,44 +761,44 @@ for it in range(1, STEPS+1):
                     draw.text((x+1, y+1), text, font=font, fill=(0,0,0))
                     draw.text((x, y), text, font=font, fill=(255,255,255))
                     pred_pil.save(str(step_out / f"pred_view{vi}.png"))
-                # Target view
+                # Save Target view
                 plt.imsave(str(step_out / f"target_view{vi}.png"), np.clip(dataset_target_imgs[vi],0,1))
 
-            # voxel export -> point cloud in world coords (like before)
+            # voxel export -> point cloud in world coords
             vg = voxel_grid.detach().cpu().numpy()[0]  # [3,D,H,W]
-            np.save(str(step_out / "voxel_grid.npy"), vg)
-            occ_values = np.linalg.norm(vg, axis=0)  # [D,H,W]
-            maxval = float(occ_values.max()) if occ_values.size and occ_values.max() > 0 else 1.0
+            np.save(str(step_out / "voxel_grid.npy"), vg)   # save voxelgrid as .npy
+            occ_values = np.linalg.norm(vg, axis=0)  # calculate occupancy [D,H,W]
+            maxval = float(occ_values.max()) if occ_values.size and occ_values.max() > 0 else 1.0   # norm to [0, 1]
             occ_norm = occ_values / (maxval + 1e-12)
-            occ = occ_norm > 0.2
-            dz, hy, wx = np.nonzero(occ)
+            occ = occ_norm > 0.2    # threshold
+            dz, hy, wx = np.nonzero(occ)    # indices of voxels
             num_pts = len(dz)
             print(f"Found {num_pts} occupied voxels (threshold=0.2 after normalizing by max={maxval:.6g}).")
 
             if num_pts > 0:
                 ix = wx.astype(np.float32); iy = hy.astype(np.float32); iz = dz.astype(np.float32)
                 cx = (ix + 0.5) / float(VOXEL_RES); cy = (iy + 0.5) / float(VOXEL_RES); cz = (iz + 0.5) / float(VOXEL_RES)
-                # world bbox depends on mesh or dataset bbox
+                # set bbox
                 if use_mesh:
                     bbox_min_np = np.array(bbox_min, dtype=np.float32); bbox_max_np = np.array(bbox_max, dtype=np.float32)
                 else:
                     bbox_min_np = np.array([-BBOX_SIZE/2.0]*3, dtype=np.float32)
                     bbox_max_np = np.array([ BBOX_SIZE/2.0]*3, dtype=np.float32)
-                world_x = bbox_min_np[0] + cx * (bbox_max_np[0] - bbox_min_np[0])
+                world_x = bbox_min_np[0] + cx * (bbox_max_np[0] - bbox_min_np[0])   # calculate world coordinates
                 world_y = bbox_min_np[1] + cy * (bbox_max_np[1] - bbox_min_np[1])
                 world_z = bbox_min_np[2] + cz * (bbox_max_np[2] - bbox_min_np[2])
-                points = np.stack([world_x, world_y, world_z], axis=1)
-                cols = vg[:, dz, hy, wx].T
-                cols = np.clip(cols, 0.0, 1.0)
-                cols_u8 = (cols * 255.0).astype(np.uint8)
+                points = np.stack([world_x, world_y, world_z], axis=1)  # [num_pts, 3]
+                cols = vg[:, dz, hy, wx].T  # extract colors
+                cols = np.clip(cols, 0.0, 1.0)  # [0, 1]
+                cols_u8 = (cols * 255.0).astype(np.uint8)   # convert to uint8
 
-                MAX_POINTS = 500000
+                MAX_POINTS = 500000 # downsample if too many points
                 if points.shape[0] > MAX_POINTS:
                     idxs = np.random.choice(points.shape[0], size=MAX_POINTS, replace=False)
                     points = points[idxs]; cols_u8 = cols_u8[idxs]
                     print(f"Downsampled voxel cloud to {MAX_POINTS} points for export.")
 
-                ply_path = step_out / "voxel_cloud.ply"
+                ply_path = step_out / "voxel_cloud.ply" # write ASCII .ply
                 with open(ply_path, "w") as f:
                     f.write("ply\nformat ascii 1.0\n")
                     f.write(f"element vertex {len(points)}\n")
@@ -843,29 +811,29 @@ for it in range(1, STEPS+1):
 
             print(f"Saved checkpoints to {step_out}")
 
-tb_writer.close()
+tb_writer.close()   # Close tensorboard
 print("Training finished. Results in:", OUTDIR)
 
 # Novel View Synthesis
 print("[NVS] Rendering novel views...")
 
-novel_out = Path(OUTDIR) / "novel_views"
+novel_out = Path(OUTDIR) / "novel_views"    # Directory for novel views
 novel_out.mkdir(parents=True, exist_ok=True)
 
-def compute_psnr(img1, img2):
+def compute_psnr(img1, img2):   # calculate PSNR
     mse = np.mean((img1 - img2) ** 2)
     if mse == 0:
         return float("inf")
     return 20 * math.log10(1.0 / math.sqrt(mse))
 
-with torch.no_grad():
+with torch.no_grad():   # Deactivate Autograd
     # If dataset poses are available, use them as novel views
     if use_dataset:
-        n_views = len(dataset_cam2worlds)
+        n_views = len(dataset_cam2worlds)   # Use dataset camera poses
         print(f"[NVS] Using {n_views} dataset poses for novel view synthesis.")
         for idx, cam2world in enumerate(dataset_cam2worlds):
             cam2world_np = cam2world
-            if use_mesh:
+            if use_mesh:    # render predicted RGB for pose
                 pred_rgb = render_via_mesh_rasterization(
                     voxel_grid, cam2world_np, float(dataset_focal), IMG_RES, IMG_RES,
                     vertices, faces_unbatched, ctx, voxel_sample_mode='bilinear',
@@ -903,8 +871,6 @@ with torch.no_grad():
                 plt.tight_layout()
                 plt.savefig(novel_out / f"compare_dataset_idx{idx:04d}.png")
                 plt.close()
-
-            #print(f"[NVS] Saved dataset-based novel view idx={idx} -> {out_path}")
     else:
         # No dataset poses: fall back to angular trajectory (as before)
         novel_angles = [0, 60, 120, 180, 240, 300]
