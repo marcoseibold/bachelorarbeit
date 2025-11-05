@@ -12,10 +12,15 @@ from torch.utils.tensorboard import SummaryWriter
 import imageio
 from PIL import Image, ImageDraw, ImageFont
 import nvdiffrast.torch as dr
+import trimesh
+from scipy.ndimage import gaussian_filter, label    # occupancy filtering
+from skimage.metrics import structural_similarity as ssim
+import lpips
+import torchvision.transforms.functional as TF
 
 # ---------------- Arguments ----------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--mesh", type=str, default=None, help="(optional) Path to GT mesh (OBJ/PLY).")
+parser.add_argument("--mesh", type=str, default=None, help="Path to GT mesh (OBJ/PLY).")
 parser.add_argument("--data_root", type=str, default=None, help="Path to NeRF-Synthetic scene folder (transforms_*.json + images).")
 parser.add_argument("--outdir", type=str, default="train_out", help="Output directory")
 parser.add_argument("--voxel_res", type=int, default=256, help="Voxel grid resolution (D,H,W)")
@@ -41,6 +46,7 @@ IMG_RES = args.img_res
 STEPS = args.steps
 LR = args.lr
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+lpips_fn = lpips.LPIPS(net='alex').to(DEVICE).eval()
 SAVE_INTERVAL = args.save_interval
 PATIENCE = args.early_stop_patience
 DELTA = args.early_stop_delta
@@ -76,9 +82,9 @@ def perspective(fovy, aspect, near, far):
     f = 1.0 / np.tan(fovy / 2.0)    # Scaling factor for FoV
     #print(f"scaling factor f: {f:.6f}")
     m = np.zeros((4, 4), dtype=np.float32)
-    m[0, 0] = f / aspect
+    m[0, 0] = f / aspect    # scale x and y
     m[1, 1] = -f    # y-flip
-    m[2, 2] = (far + near) / (near - far)
+    m[2, 2] = (far + near) / (near - far)   # map to clip coords
     m[2, 3] = (2 * far * near) / (near - far)
     m[3, 2] = -1.0
     #print(f"Projection matrix: {m}")
@@ -226,6 +232,52 @@ def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
     pred_rgb[~mask] = 1.0
 
     # if it % SAVE_INTERVAL == 0 or it == 1:
+    
+    #     u = rast_out[0, ..., 0].detach().cpu().numpy()   # channel 0 = bary u
+    #     v = rast_out[0, ..., 1].detach().cpu().numpy()   # channel 1 = bary v
+    #     w = 1.0 - u - v
+
+    #     plt.figure(figsize=(9,3))
+    #     plt.subplot(1,3,1)
+    #     plt.imshow(u, cmap='magma')
+    #     plt.title('bary u')
+    #     plt.axis('off')
+
+    #     plt.subplot(1,3,2)
+    #     plt.imshow(v, cmap='magma')
+    #     plt.title('bary v')
+    #     plt.axis('off')
+
+    #     plt.subplot(1,3,3)
+    #     plt.imshow(w, cmap='magma')
+    #     plt.title('bary w (1-u-v)')
+    #     plt.axis('off')
+
+    #     plt.tight_layout()
+    #     plt.savefig(os.path.join(OUTDIR, "bary.png"), dpi=150)
+    #     plt.show()
+
+    #     # Triangle indexes
+    #     tri_id = rast_out[0, ..., 3]  # [H,W]
+
+    #     # Mask
+    #     valid = tri_id > 0
+    #     max_id = int(tri_id.max().item()) if valid.any() else 0
+
+    #     # Random colors
+    #     if max_id > 0:
+    #         rng = np.random.default_rng(42)
+    #         colors = rng.random((max_id + 1, 3), dtype=np.float32)  # [id, RGB]
+    #         colors[0] = 1.0  # white background
+    #         tri_vis = colors[tri_id.long().cpu().numpy()]  # [H,W,3]
+    #     else:
+    #         tri_vis = np.ones((*tri_id.shape, 3), dtype=np.float32)
+
+    #     plt.imsave("bary_triangle_id.png", tri_vis)
+    #     plt.imshow(tri_vis)
+    #     plt.title("Triangle ID visualization")
+    #     plt.axis("off")
+    #     plt.show()
 
     #     verts = verts_h[0, :, :3] / verts_h[0, :, 3:4]
     #     fig = plt.figure()
@@ -299,64 +351,64 @@ def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
     #     plt.savefig(os.path.join(OUTDIR, "pos_clip.png"), dpi=150)
     #     plt.show()
 
-        # rast = rast_out[0].cpu().numpy()
-        # mask = rast[..., 3] > 0  # Pixel hit by a face
-        # plt.figure(figsize=(5,5))
-        # plt.imshow(mask, cmap='gray')
-        # plt.axis('off')
-        # plt.title("Rasterization Mask")
-        # plt.savefig(os.path.join(OUTDIR, "rast_out_mask.png"), dpi=150)
-        # plt.show()
+    #     rast = rast_out[0].cpu().numpy()
+    #     mask = rast[..., 3] > 0  # Pixel hit by a face
+    #     plt.figure(figsize=(5,5))
+    #     plt.imshow(mask, cmap='gray')
+    #     plt.axis('off')
+    #     plt.title("Rasterization Mask")
+    #     plt.savefig(os.path.join(OUTDIR, "rast_out_mask.png"), dpi=150)
+    #     plt.show()
 
-        # face_idx_map = rast[..., 0]  # Face-Index
-        # plt.figure(figsize=(5,5))
-        # plt.imshow(face_idx_map, cmap='viridis')
-        # plt.axis('off')
-        # plt.title("Face Index Map")
-        # plt.savefig(os.path.join(OUTDIR, "rast_out_face.png"), dpi=150)
-        # plt.show()
+    #     face_idx_map = rast[..., 0]  # Face-Index
+    #     plt.figure(figsize=(5,5))
+    #     plt.imshow(face_idx_map, cmap='viridis')
+    #     plt.axis('off')
+    #     plt.title("Face Index Map")
+    #     plt.savefig(os.path.join(OUTDIR, "rast_out_face.png"), dpi=150)
+    #     plt.show()
 
-        # u = rast_out[0, ..., 1].cpu().numpy()
-        # v = rast_out[0, ..., 2].cpu().numpy()
-        # w = 1 - u - v
-        # plt.subplot(1,2,1); plt.imshow(u, cmap='magma'); plt.title('bary u'); plt.axis('off')
-        # plt.subplot(1,2,2); plt.imshow(v, cmap='magma'); plt.title('bary v'); plt.axis('off'); plt.savefig(os.path.join(OUTDIR, "bary_v.png"), dpi=150)
-        # plt.imshow(w, cmap='magma'); plt.title("bary w"); plt.show(); plt.savefig(os.path.join(OUTDIR, "bary_w.png"), dpi=150)
-        # plt.show()
+    #     u = rast_out[0, ..., 1].cpu().numpy()
+    #     v = rast_out[0, ..., 2].cpu().numpy()
+    #     w = 1 - u - v
+    #     plt.subplot(1,2,1); plt.imshow(u, cmap='magma'); plt.title('bary u'); plt.axis('off')
+    #     plt.subplot(1,2,2); plt.imshow(v, cmap='magma'); plt.title('bary v'); plt.axis('off'); plt.savefig(os.path.join(OUTDIR, "bary_v.png"), dpi=150)
+    #     plt.imshow(w, cmap='magma'); plt.title("bary w"); plt.show(); plt.savefig(os.path.join(OUTDIR, "bary_w.png"), dpi=150)
+    #     plt.show()
 
-        # pred_np = pos_map.detach().cpu().numpy()
-        # plt.figure(figsize=(5,5))
-        # plt.imshow(pos_map[..., 1].detach().cpu().numpy())
-        # plt.axis('off')
-        # plt.title("pos_map")
-        # plt.savefig(os.path.join(OUTDIR, "pos_map.png"), dpi=150)
-        # plt.show()
+    #     pred_np = pos_map.detach().cpu().numpy()
+    #     plt.figure(figsize=(5,5))
+    #     plt.imshow(pos_map[..., 1].detach().cpu().numpy())
+    #     plt.axis('off')
+    #     plt.title("pos_map")
+    #     plt.savefig(os.path.join(OUTDIR, "pos_map.png"), dpi=150)
+    #     plt.show()
 
-        # verts = grid_coords.reshape(-1, 3)  # [H*W, 3]
-        # fig = plt.figure()
-        # ax = fig.add_subplot(111, projection='3d')
-        # ax.scatter(verts[:,0].cpu(), verts[:,1].cpu(), verts[:,2].cpu(), s=0.2)
-        # cam_pos_w = torch.tensor(cam2world_np[:3, 3], dtype=torch.float32, device=DEVICE)
-        # cam_pos_grid = world_to_grid_coords(cam_pos_w)
-        # cpg = cam_pos_grid.detach().cpu().numpy()
-        # ax.scatter([cpg[0]], [cpg[1]], [cpg[2]], c='k', s=30, label='camera')
-        # ax.set_xlabel('X')
-        # ax.set_ylabel('Y')
-        # ax.set_zlabel('Z')
-        # ax.set_box_aspect([1,1,1])
-        # ax.set_proj_type('ortho')
-        # ax.legend(loc='upper right')
-        # plt.title("grid_coords + camera")
-        # plt.savefig(os.path.join(OUTDIR, "grid_coords.png"), dpi=150)
-        # plt.show()
+    #     verts = grid_coords.reshape(-1, 3)  # [H*W, 3]
+    #     fig = plt.figure()
+    #     ax = fig.add_subplot(111, projection='3d')
+    #     ax.scatter(verts[:,0].cpu(), verts[:,1].cpu(), verts[:,2].cpu(), s=0.2)
+    #     cam_pos_w = torch.tensor(cam2world_np[:3, 3], dtype=torch.float32, device=DEVICE)
+    #     cam_pos_grid = world_to_grid_coords(cam_pos_w)
+    #     cpg = cam_pos_grid.detach().cpu().numpy()
+    #     ax.scatter([cpg[0]], [cpg[1]], [cpg[2]], c='k', s=30, label='camera')
+    #     ax.set_xlabel('X')
+    #     ax.set_ylabel('Y')
+    #     ax.set_zlabel('Z')
+    #     ax.set_box_aspect([1,1,1])
+    #     ax.set_proj_type('ortho')
+    #     ax.legend(loc='upper right')
+    #     plt.title("grid_coords + camera")
+    #     plt.savefig(os.path.join(OUTDIR, "grid_coords.png"), dpi=150)
+    #     plt.show()
 
-        # rgb = sampled[..., :3]
-        # plt.figure(figsize=(5,5))
-        # plt.imshow(rgb.detach().cpu().numpy(), cmap='gray')
-        # plt.axis('off')
-        # plt.title("pred_rgb")
-        # plt.savefig(os.path.join(OUTDIR, "pred_rgb.png"), dpi=150)
-        # plt.show()
+    #     rgb = sampled[..., :3]
+    #     plt.figure(figsize=(5,5))
+    #     plt.imshow(rgb.detach().cpu().numpy(), cmap='gray')
+    #     plt.axis('off')
+    #     plt.title("pred_rgb")
+    #     plt.savefig(os.path.join(OUTDIR, "pred_rgb.png"), dpi=150)
+    #     plt.show()
 
     return pred_rgb
 
@@ -394,6 +446,9 @@ if DATA_ROOT is not None:
         pil = Image.open(img_path).convert("RGBA")  # Open image and convert to RGBA
         if pil.size != (IMG_RES, IMG_RES):
             pil = pil.resize((IMG_RES, IMG_RES), resample=Image.LANCZOS)    # Resize image
+            # tensor = TF.to_tensor(pil).unsqueeze(0)  # [1, C, H, W]
+            # resized = F.interpolate(tensor, size=(IMG_RES, IMG_RES), mode='bilinear', align_corners=True)
+            # pil = TF.to_pil_image(resized.squeeze(0))
         arr = np.array(pil).astype(np.float32)  # Save in array [IMG_RES,IMG_RES,4]
 
         alpha = arr[..., 3] / 255.0 # Alpha normalized to [0,1]
@@ -420,7 +475,6 @@ mesh = None
 use_mesh = False
 
 if MESH_PATH is not None:
-    import trimesh
     loaded = trimesh.load(MESH_PATH, process=True)  # Load mesh (correct triang, norms)
     if isinstance(loaded, trimesh.Scene):   # If Scene, try to create single trimesh
         try:
@@ -838,7 +892,6 @@ for it in range(1, STEPS+1):
     scaler.scale(mean_loss).backward()   # backpropagation
     scaler.step(optimizer)  # parameter update
     scaler.update() # update AMP scaling
-    #optimizer.zero_grad()   # Reset gradients
 
     total_loss = mean_loss.item()
 
@@ -901,7 +954,6 @@ for it in range(1, STEPS+1):
             np.save(str(step_out / "voxel_grid.npy"), vg)   # save voxelgrid as .npy
             occ_values = np.linalg.norm(vg, axis=0)  # calculate occupancy [D,H,W]
 
-            from scipy.ndimage import gaussian_filter, label    # occupancy filtering
             occ_smooth = gaussian_filter(occ_values, sigma=1.0) # remove noise
             thr = np.percentile(occ_smooth, 95) # 95 percentile of voxels
             occ = occ_smooth >= thr # Mask
@@ -989,6 +1041,9 @@ if DATA_ROOT is not None:
         pil = Image.open(img_path).convert("RGBA")  # Open image and convert to RGBA
         if pil.size != (IMG_RES, IMG_RES):
             pil = pil.resize((IMG_RES, IMG_RES), resample=Image.LANCZOS)    # Resize image
+            # tensor = TF.to_tensor(pil).unsqueeze(0)  # [1, C, H, W]
+            # resized = F.interpolate(tensor, size=(IMG_RES, IMG_RES), mode='bilinear', align_corners=True)
+            # pil = TF.to_pil_image(resized.squeeze(0))
         arr = np.array(pil).astype(np.float32)  # Save in array [IMG_RES,IMG_RES,4]
 
         alpha = arr[..., 3] / 255.0 # Alpha normalized to [0,1]
@@ -1155,6 +1210,21 @@ def compute_psnr(img1, img2):   # calculate PSNR
         return float("inf")
     return 20 * math.log10(1.0 / math.sqrt(mse))
 
+def to_nchw01(x_np):
+    # [H,W,3] in [0,1]  ->  [1,3,H,W] torch float32
+    x = torch.from_numpy(np.clip(x_np, 0.0, 1.0)).permute(2,0,1).unsqueeze(0)
+    x = x.to(memory_format=torch.contiguous_format).contiguous()
+    return x.to(device=DEVICE, dtype=torch.float32)
+
+def compute_lpips(pred_rgb, gt_img):    # calculate LPIPS
+    x = to_nchw01(pred_rgb)
+    y = to_nchw01(gt_img)
+    x = x * 2.0 - 1.0   # LPIPS needs [-1,1]
+    y = y * 2.0 - 1.0
+    with torch.no_grad():
+        v = lpips_fn(x, y).item()
+    return float(v)
+
 with torch.no_grad():   # Deactivate Autograd
     # If dataset poses are available, use them as novel views
     if use_dataset:
@@ -1188,18 +1258,16 @@ with torch.no_grad():   # Deactivate Autograd
                 # fallback: match modulo if counts differ
                 gt_img = dataset_target_imgs_test[idx % len(dataset_target_imgs_test)]
 
-            # Calculate SSIM
-            from skimage.metrics import structural_similarity as ssim
-            ssim_val = ssim((pred_rgb*255).astype(np.uint8), (gt_img*255).astype(np.uint8), multichannel=True)
-
-            if gt_img is not None:
+            if gt_img is not None: # Calculate PSNR, SSIM and LPIPS, plot comparison
                 psnr_val = compute_psnr(pred_rgb, gt_img)
+                ssim_val = ssim((pred_rgb*255).astype(np.uint8), (gt_img*255).astype(np.uint8), multichannel=True)
+                lpips_val = compute_lpips(pred_rgb, gt_img)
                 fig, axs = plt.subplots(1, 2, figsize=(16,8), constrained_layout=True)
                 axs[0].imshow(np.clip(gt_img,0,1))
                 axs[0].set_title("Ground Truth")
                 axs[0].axis("off")
                 axs[1].imshow(np.clip(pred_rgb,0,1))
-                axs[1].set_title(f"Novel View\nPSNR={psnr_val:.2f} dB\nSSIM={ssim_val:.2f}")
+                axs[1].set_title(f"Novel View\nPSNR={psnr_val:.2f} dB\nSSIM={ssim_val:.2f}\nLPIPS={lpips_val:.3f}")
                 axs[1].axis("off")
                 plt.savefig(novel_out / f"compare_dataset_idx{idx:04d}.png")
                 plt.close()
