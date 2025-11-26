@@ -18,6 +18,7 @@ from skimage.metrics import structural_similarity as ssim
 import lpips
 import torchvision.transforms.functional as TF
 
+from dataset_loader import load_dataset
 from tensorf_appearance import ColorFieldVM
 
 # ---------------- Arguments ----------------
@@ -27,15 +28,15 @@ parser.add_argument("--data_root", type=str, default=None, help="Path to NeRF-Sy
 parser.add_argument("--outdir", type=str, default="train_out", help="Output directory")
 parser.add_argument("--voxel_res", type=int, default=256, help="Voxel grid resolution (D,H,W)")
 parser.add_argument("--img_res", type=int, default=800, help="Image resolution (H and W)")
-parser.add_argument("--steps", type=int, default=1000, help="Training iterations")
+parser.add_argument("--steps", type=int, default=5000, help="Training iterations")
 parser.add_argument("--lr", type=float, default=1e-2, help="Learning rate")
 parser.add_argument("--save_interval", type=int, default=100, help="Save image/checkpoint every N steps")
 parser.add_argument("--early_stop_patience", type=int, default=50, help="Stop training if no improvement in N steps")
 parser.add_argument("--early_stop_delta", type=float, default=1e-6, help="Minimum change to consider an improvement")
 parser.add_argument("--bbox_size", type=float, default=2.0, help="Scene bounding box (cube side length) used when no mesh provided")
 parser.add_argument("--n_samples", type=int, default=64, help="Samples per ray for volumetric rendering")
-parser.add_argument("--near", type=float, default=0.1, help="Near plane for ray sampling")
-parser.add_argument("--far", type=float, default=6.0, help="Far plane for ray sampling")
+parser.add_argument("--near", type=float, default=0.1, help="Near plane for ray sampling")  # 2.5 for m360 (counter 1.0)
+parser.add_argument("--far", type=float, default=6.0, help="Far plane for ray sampling")    # 100.0 for m360
 parser.add_argument("--img_count", type=int, default=100, help="Training image count")
 parser.add_argument("--test_img_count", type=int, default=200, help="Test image count")
 args = parser.parse_args()
@@ -85,7 +86,7 @@ def perspective(fovy, aspect, near, far):
     #print(f"scaling factor f: {f:.6f}")
     m = np.zeros((4, 4), dtype=np.float32)
     m[0, 0] = f / aspect    # scale x and y
-    m[1, 1] = -f    # y-flip
+    m[1, 1] = f    # y-flip, deactivate for m360
     m[2, 2] = (far + near) / (near - far)   # map to clip coords
     m[2, 3] = (2 * far * near) / (near - far)
     m[3, 2] = -1.0
@@ -231,9 +232,15 @@ def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
 
     # Set background to white
     mask = rast_out[0, ..., 3] > 0  # Pixels hit by rasterization
-    pred_rgb[~mask] = 1.0
+    pred_rgb[~mask] = 1.0   # for m360: pred_rgb = torch.flip(pred_rgb, dims=[1])
 
-    return pred_rgb
+    # Antialiasing
+    pred_rgb_batched = pred_rgb.unsqueeze(0).contiguous().float() # [1,H,W,3]
+    rast_aa = rast_out.contiguous().float()
+    pos_clip_aa = pos_clip.contiguous().float()
+    pred_rgb_aa = dr.antialias(pred_rgb_batched, rast_aa, pos_clip_aa, faces_unbatched)[0]
+
+    return pred_rgb_aa
 
 def render_via_mesh_rasterization_colorfield(
     color_field, cam2world_np, focal, H, W,
@@ -265,57 +272,28 @@ def render_via_mesh_rasterization_colorfield(
     if valid_idx.numel() > 0:
         rgb_valid = color_field(xyz[valid_idx], vdir[valid_idx])    # RGB in [M,3]
         rgb_out[valid_idx] = torch.clamp(rgb_valid, 0.0, 1.0)   # Clamp
+    img = rgb_out.view(H, W, 3) # [H,W,3]
+    img = torch.flip(img, dims=[1]) # only for m360
+    # Antialiasing
+    img_batched = img.unsqueeze(0).contiguous().float()  # [1,H,W,3]
+    rast_aa    = rast_out.contiguous().float()
+    pos_clip_aa = pos_clip.contiguous().float()
+    img_aa = dr.antialias(img_batched, rast_aa, pos_clip_aa, faces_unbatched)[0]
 
-    return rgb_out.view(H, W, 3)    # [H,W,3]
+    return img_aa    # [H,W,3]
 
 # ---------------- Prepare scene (mesh or bbox) & load dataset if requested ----------------
-use_dataset = False
-dataset_target_imgs = []
-dataset_target_masks = []
-dataset_cam2worlds = []
-dataset_focal = None
-
 if DATA_ROOT is not None:
-    # Open and validate transforms_train.json
-    json_path = os.path.join(DATA_ROOT, "transforms_train.json")
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"Dataset transforms_train.json not found at {json_path}")
-    meta = json.load(open(json_path, "r"))
-    frames = meta.get("frames", []) # Load frames into list
-    if len(frames) == 0:
-        raise ValueError("transforms_train.json contains 0 frames")
+    print(f"[INFO] Loading dataset from {DATA_ROOT} ...")
     use_dataset = True
-    dataset_focal = 0.5 * IMG_RES / np.tan(0.5 * float(meta["camera_angle_x"])) # Calculate FoV
-    print(f"[INFO] Dataset found: {len(frames)} frames, focal(derived) = {dataset_focal:.3f}")
-
-    for fr in frames:
-        cam2world = np.array(fr["transform_matrix"], dtype=np.float32)  # Read transform_matrix
-        dataset_cam2worlds.append(cam2world)    # Append camera->world matrices to list
-        # Load image
-        img_path = os.path.join(DATA_ROOT, fr["file_path"] + ".png")
-        if not os.path.exists(img_path):
-            alt = img_path.replace(".png", ".jpg")
-            if os.path.exists(alt):
-                img_path = alt
-            else:
-                raise FileNotFoundError(f"Image not found: {img_path}")
-        pil = Image.open(img_path).convert("RGBA")  # Open image and convert to RGBA
-        if pil.size != (IMG_RES, IMG_RES):
-            pil = pil.resize((IMG_RES, IMG_RES), resample=Image.LANCZOS)    # Resize image
-            # tensor = TF.to_tensor(pil).unsqueeze(0)  # [1, C, H, W]
-            # resized = F.interpolate(tensor, size=(IMG_RES, IMG_RES), mode='bilinear', align_corners=True)
-            # pil = TF.to_pil_image(resized.squeeze(0))
-        arr = np.array(pil).astype(np.float32)  # Save in array [IMG_RES,IMG_RES,4]
-
-        alpha = arr[..., 3] / 255.0 # Alpha normalized to [0,1]
-
-        # Premultiply: RGB * alpha
-        a = alpha[..., None].astype(np.float32)            # Alpha in [0,1], [H,W,1]
-        rgb = (arr[..., :3] / 255.0).astype(np.float32) * a + (1.0 - a) # alpha-blending (Background set to white if a = 0)
-
-        mask = alpha.astype(np.float32) # Alpha mask in [0,1]
-        dataset_target_imgs.append(rgb.astype(np.float32))  # Save images to list
-        dataset_target_masks.append(mask.astype(np.float32))    # Save masks to list
+    (dataset_cam2worlds,
+     dataset_target_imgs,
+     dataset_target_masks,
+     dataset_focal,
+     dataset_intrinsics_per_frame) = load_dataset(DATA_ROOT, IMG_RES, split="train")
+    DATA_H, DATA_W = dataset_target_imgs[0].shape[:2]
+    print(f"[INFO] Using dataset resolution H={DATA_H}, W={DATA_W}")
+    print(f"[INFO] Train frames: {len(dataset_cam2worlds)}, focal≈{dataset_focal:.3f}")
 
 # print("Example cam2world matrix (frame 0):")
 # print(dataset_cam2worlds[0])
@@ -354,10 +332,10 @@ if MESH_PATH is not None:
     mesh_vertices = mesh.vertices.astype(np.float32)    # Convert to float32
     mesh.vertices = mesh_vertices
 
-    r = np.array([[1, 0, 0],
-              [0, 0,-1],
-              [0, 1, 0]])
-    mesh.vertices = mesh.vertices @ r.T # Rotate coordinates with rotation matrix
+    # r = np.array([[1, 0, 0],
+    #           [0, 0,-1],
+    #           [0, 1, 0]])
+    # mesh.vertices = mesh.vertices @ r.T # Rotate coordinates with rotation matrix
 
     # verts = mesh.vertices
     # faces = mesh.faces
@@ -372,65 +350,65 @@ if MESH_PATH is not None:
     # plt.show()
 
     # prepare visuals: vertex colors or texture or fallback
-    use_vertex_colors = False
-    use_texture = False
-    texture_tensor = None
-    uv_attr = None
+    # use_vertex_colors = False
+    # use_texture = False
+    # texture_tensor = None
+    # uv_attr = None
 
-    if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None and mesh.visual.vertex_colors.shape[1] >= 3:
-        unique_colors = np.unique(mesh.visual.vertex_colors[:, :3], axis=0) # Check for different colors
-        if len(unique_colors) > 1:
-            use_vertex_colors = True
-            vcol = mesh.visual.vertex_colors[:, :3] / 255.0
-            vcol = np.clip(vcol, 0.0, 1.0).astype(np.float32)   # Norm to [0,1]
-            vcol_tensor = torch.tensor(vcol, dtype=torch.float32, device=DEVICE)    # Convert to tensor
-            print("[INFO] Using vertex colors on mesh.")
+    # if hasattr(mesh.visual, "vertex_colors") and mesh.visual.vertex_colors is not None and mesh.visual.vertex_colors.shape[1] >= 3:
+    #     unique_colors = np.unique(mesh.visual.vertex_colors[:, :3], axis=0) # Check for different colors
+    #     if len(unique_colors) > 1:
+    #         use_vertex_colors = True
+    #         vcol = mesh.visual.vertex_colors[:, :3] / 255.0
+    #         vcol = np.clip(vcol, 0.0, 1.0).astype(np.float32)   # Norm to [0,1]
+    #         vcol_tensor = torch.tensor(vcol, dtype=torch.float32, device=DEVICE)    # Convert to tensor
+    #         print("[INFO] Using vertex colors on mesh.")
 
-    tex_obj = getattr(mesh.visual.material, "image", None) if hasattr(mesh.visual, "material") else None
-    if (not use_vertex_colors) and hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and tex_obj is not None:
-        # load texture robustly
-        def load_image_obj(obj):
-            if isinstance(obj, str):
-                arr = imageio.imread(obj)   # Image path
-                if arr.ndim == 2:
-                    arr = np.stack([arr]*3, axis=-1)
-                return arr[..., :3].astype(np.uint8)
-            if isinstance(obj, Image.Image):
-                arr = np.array(obj.convert("RGB"))  # Pillow-Image
-                return arr[..., :3].astype(np.uint8)
-            if isinstance(obj, np.ndarray):
-                arr = obj   # Array
-                if arr.ndim == 2:
-                    arr = np.stack([arr]*3, axis=-1)
-                return arr[..., :3].astype(np.uint8)
-            if hasattr(obj, "read"):
-                arr = imageio.imread(obj)   # File-like object
-                if arr.ndim == 2:
-                    arr = np.stack([arr]*3, axis=-1)
-                return arr[..., :3].astype(np.uint8)
-            arr = imageio.imread(obj)
-            if arr.ndim == 2:
-                arr = np.stack([arr]*3, axis=-1)
-            return arr[..., :3].astype(np.uint8)
-        try:
-            tex_np = load_image_obj(tex_obj)    # Load texture with function
-            texture_tensor = torch.tensor(tex_np, dtype=torch.float32, device=DEVICE) / 255.0   # Norm
-            texture_tensor = texture_tensor.permute(2,0,1).unsqueeze(0)  # [1,3,H,W]
-            uv_attr = torch.tensor(mesh.visual.uv, dtype=torch.float32, device=DEVICE)  # Save UV coordinates
-            use_texture = True  
-            print("[INFO] Mesh texture loaded from material.image")
-        except Exception as e:
-            print("[WARN] Could not load mesh texture:", e)
+    # tex_obj = getattr(mesh.visual.material, "image", None) if hasattr(mesh.visual, "material") else None
+    # if (not use_vertex_colors) and hasattr(mesh.visual, "uv") and mesh.visual.uv is not None and tex_obj is not None:
+    #     # load texture robustly
+    #     def load_image_obj(obj):
+    #         if isinstance(obj, str):
+    #             arr = imageio.imread(obj)   # Image path
+    #             if arr.ndim == 2:
+    #                 arr = np.stack([arr]*3, axis=-1)
+    #             return arr[..., :3].astype(np.uint8)
+    #         if isinstance(obj, Image.Image):
+    #             arr = np.array(obj.convert("RGB"))  # Pillow-Image
+    #             return arr[..., :3].astype(np.uint8)
+    #         if isinstance(obj, np.ndarray):
+    #             arr = obj   # Array
+    #             if arr.ndim == 2:
+    #                 arr = np.stack([arr]*3, axis=-1)
+    #             return arr[..., :3].astype(np.uint8)
+    #         if hasattr(obj, "read"):
+    #             arr = imageio.imread(obj)   # File-like object
+    #             if arr.ndim == 2:
+    #                 arr = np.stack([arr]*3, axis=-1)
+    #             return arr[..., :3].astype(np.uint8)
+    #         arr = imageio.imread(obj)
+    #         if arr.ndim == 2:
+    #             arr = np.stack([arr]*3, axis=-1)
+    #         return arr[..., :3].astype(np.uint8)
+    #     try:
+    #         tex_np = load_image_obj(tex_obj)    # Load texture with function
+    #         texture_tensor = torch.tensor(tex_np, dtype=torch.float32, device=DEVICE) / 255.0   # Norm
+    #         texture_tensor = texture_tensor.permute(2,0,1).unsqueeze(0)  # [1,3,H,W]
+    #         uv_attr = torch.tensor(mesh.visual.uv, dtype=torch.float32, device=DEVICE)  # Save UV coordinates
+    #         use_texture = True  
+    #         print("[INFO] Mesh texture loaded from material.image")
+    #     except Exception as e:
+    #         print("[WARN] Could not load mesh texture:", e)
 
-    if (not use_vertex_colors) and (not use_texture):   # Position based fallback
-        v_world = mesh.vertices.astype(np.float32)
-        bbox_min_local = v_world.min(axis=0)
-        bbox_max_local = v_world.max(axis=0)
-        vcol = (v_world - bbox_min_local) / (bbox_max_local - bbox_min_local + 1e-8)
-        vcol = np.clip(vcol, 0.0, 1.0)
-        vcol_tensor = torch.tensor(vcol, dtype=torch.float32, device=DEVICE)
-        use_vertex_colors = True
-        print("[INFO] Using fallback position-based vertex colors for mesh.")
+    # if (not use_vertex_colors) and (not use_texture):   # Position based fallback
+    #     v_world = mesh.vertices.astype(np.float32)
+    #     bbox_min_local = v_world.min(axis=0)
+    #     bbox_max_local = v_world.max(axis=0)
+    #     vcol = (v_world - bbox_min_local) / (bbox_max_local - bbox_min_local + 1e-8)
+    #     vcol = np.clip(vcol, 0.0, 1.0)
+    #     vcol_tensor = torch.tensor(vcol, dtype=torch.float32, device=DEVICE)
+    #     use_vertex_colors = True
+    #     print("[INFO] Using fallback position-based vertex colors for mesh.")
 
     # prepare tensors for rasterizer
     vertices_np = mesh.vertices.astype(np.float32)  # Get vertex positions of mesh
@@ -667,7 +645,8 @@ if MESH_PATH is not None:
 #         print("[Extra visualization] skipped due to error:", e)
 
 ctx = dr.RasterizeCudaContext() # Create nvdiffrast CUDA-Rasterizer-Context
-H = IMG_RES; W = IMG_RES    # Set resolution
+# H = IMG_RES; W = IMG_RES    # Set resolution
+H = DATA_H; W = DATA_W
 
 # ColorFieldVM setup
 extent_vec = (bbox_max_t - bbox_min_t).abs()    # Vector with scene size
@@ -675,7 +654,7 @@ scene_extent = float(torch.as_tensor(extent_vec).max().item()) * 0.5  # scale to
 
 # Build Appearance-Modell
 color_field = ColorFieldVM(
-    n_voxels=1024**3,   # res
+    n_voxels=3000**3,   # res (1024 for NeRF Synthetic)
     device=DEVICE,
     app_n_comp=16,  # rank
     sh_degree=2,    # spherical harmonic degree
@@ -683,8 +662,8 @@ color_field = ColorFieldVM(
 ).to(DEVICE)
 
 # Optimizer with seperate learning rates
-opt = torch.optim.Adam(color_field.get_optparam_groups(), lr=LR, betas=(0.9, 0.99))
-lambda_tv = 1e-2    # total variation weight
+opt = torch.optim.Adam(color_field.get_optparam_groups(), betas=(0.9, 0.99))
+# lambda_tv = 1e-2    # total variation weight
 
 # Prepare voxel grid + optimizer + loss
 # voxel_grid = torch.nn.Parameter(torch.rand(1, 3, VOXEL_RES, VOXEL_RES, VOXEL_RES, device=DEVICE))
@@ -715,6 +694,8 @@ best_loss = float('inf'); no_improve_steps = 0
 
 print("[TRAIN] Start training...")
 scaler = torch.cuda.amp.GradScaler()    # Initialize GradScaler for AMP
+views_per_it = 1
+num_views = len(dataset_cam2worlds)
 
 # Training loop:
 for it in range(1, STEPS+1):
@@ -722,14 +703,18 @@ for it in range(1, STEPS+1):
     #optimizer.zero_grad()   # Reset gradients before backprop
     total_mse_sum = torch.tensor(0.0, device=DEVICE)   # sum of squared errors (over all valid scalar entries)
     total_num_entries = 0.0 # counter 
+    lr_factor = 0.1 ** (1 / STEPS)
+    TV_loss_weight = 1.0
 
     if use_dataset:
-        for vi, cam2world in enumerate(dataset_cam2worlds): # iterate over all dataset poses
+        idxs = np.random.choice(num_views, size=min(views_per_it, num_views), replace=False)
+        for vi in idxs: # iterate over dataset poses
+            cam2world = dataset_cam2worlds[vi]
             cam2world_t = torch.from_numpy(cam2world).to(device=DEVICE, dtype=torch.float32)
             with torch.cuda.amp.autocast(): # AMP for memory saving
-                cam2world_np = cam2world_t.cpu().numpy()
+                cam2world_np = cam2world_t.detach().cpu().numpy()
                 pred_map = render_via_mesh_rasterization_colorfield(
-                        color_field, cam2world_np, float(dataset_focal), IMG_RES, IMG_RES,
+                        color_field, cam2world_np, float(dataset_focal), H, W,
                         vertices, faces_unbatched, ctx, near=NEAR, far=FAR, device=DEVICE
                     )
                 # pred_map: torch tensor [H,W,3] on device
@@ -763,7 +748,8 @@ for it in range(1, STEPS+1):
 
     opt.zero_grad() # reset gradients
     mean_loss = total_mse_sum / float(total_num_entries)   # MSE, tensor on DEVICE
-    loss = mean_loss + lambda_tv * color_field.TV_loss()    # TV loss
+    TV_loss_weight *= lr_factor
+    loss = mean_loss + TV_loss_weight * color_field.TV_loss()    # TV loss
 
     scaler.scale(loss).backward()   # backpropagation
     scaler.step(opt)  # parameter update
@@ -798,7 +784,7 @@ for it in range(1, STEPS+1):
                 focal_to_use = float(dataset_focal)
                 # render predicted views
                 pred_map = render_via_mesh_rasterization_colorfield(
-                    color_field, cam2world_np, float(dataset_focal), IMG_RES, IMG_RES,
+                    color_field, cam2world_np, float(dataset_focal), H, W,
                     vertices, faces_unbatched, ctx, near=NEAR, far=FAR, device=DEVICE
                 )  # returns torch Tensor [H,W,3] on DEVICE
 
@@ -822,7 +808,8 @@ for it in range(1, STEPS+1):
                     draw.text((x, y), text, font=font, fill=(255,255,255))
                     pred_pil.save(str(step_out / f"pred_view{vi}.png"))
                 # Save Target view
-                plt.imsave(str(step_out / f"target_view{vi}.png"), np.clip(dataset_target_imgs[vi],0,1))
+                if it == 1:
+                    plt.imsave(str(step_out / f"target_view{vi}.png"), np.clip(dataset_target_imgs[vi],0,1))
 
             # voxel export -> point cloud in world coords
             # vg = voxel_grid.detach().cpu().numpy()[0]  # [3,D,H,W]
@@ -885,51 +872,21 @@ print("[NVS] Rendering novel views...")
 
 novel_out = Path(OUTDIR) / "novel_views"    # Directory for novel views
 novel_out.mkdir(parents=True, exist_ok=True)
-dataset_cam2worlds_test = []
-dataset_target_imgs_test = []
-dataset_target_masks_test = []
 
 if DATA_ROOT is not None:
-    # Open and validate transforms_test.json
-    json_path = os.path.join(DATA_ROOT, "transforms_test.json")
-    if not os.path.exists(json_path):
-        raise FileNotFoundError(f"Dataset transforms_test.json not found at {json_path}")
-    meta = json.load(open(json_path, "r"))
-    frames_test = meta.get("frames", []) # Load frames into list
-    if len(frames_test) == 0:
-        raise ValueError("transforms_test.json contains 0 frames")
-    use_dataset = True
-    dataset_focal = 0.5 * IMG_RES / np.tan(0.5 * float(meta["camera_angle_x"])) # Calculate FoV
-    print(f"[INFO] Test set found: {len(frames_test)} frames, focal(derived) = {dataset_focal:.3f}")
-
-    for fr in frames_test:
-        cam2world = np.array(fr["transform_matrix"], dtype=np.float32)  # Read transform_matrix
-        dataset_cam2worlds_test.append(cam2world)    # Append camera->world matrices to list
-        # Load image
-        img_path = os.path.join(DATA_ROOT, fr["file_path"] + ".png")
-        if not os.path.exists(img_path):
-            alt = img_path.replace(".png", ".jpg")
-            if os.path.exists(alt):
-                img_path = alt
-            else:
-                raise FileNotFoundError(f"Image not found: {img_path}")
-        pil = Image.open(img_path).convert("RGBA")  # Open image and convert to RGBA
-        if pil.size != (IMG_RES, IMG_RES):
-            pil = pil.resize((IMG_RES, IMG_RES), resample=Image.LANCZOS)    # Resize image
-            # tensor = TF.to_tensor(pil).unsqueeze(0)  # [1, C, H, W]
-            # resized = F.interpolate(tensor, size=(IMG_RES, IMG_RES), mode='bilinear', align_corners=True)
-            # pil = TF.to_pil_image(resized.squeeze(0))
-        arr = np.array(pil).astype(np.float32)  # Save in array [IMG_RES,IMG_RES,4]
-
-        alpha = arr[..., 3] / 255.0 # Alpha normalized to [0,1]
-
-        # Premultiply: RGB * alpha
-        a = alpha[..., None].astype(np.float32)            # Alpha in [0,1], [H,W,1]
-        rgb = (arr[..., :3] / 255.0).astype(np.float32) * a + (1.0 - a) # alpha-blending
-
-        mask = alpha.astype(np.float32) # Alpha mask in [0,1]
-        dataset_target_imgs_test.append(rgb.astype(np.float32))  # Save images to list
-        dataset_target_masks_test.append(mask.astype(np.float32))    # Save masks to list
+    try:
+        (dataset_cam2worlds_test,
+         dataset_target_imgs_test,
+         dataset_target_masks_test,
+         _,
+         dataset_intrinsics_per_frame_test) = load_dataset(DATA_ROOT, IMG_RES, split="test")
+        print(f"[INFO] Test frames: {len(dataset_cam2worlds_test)}")
+    except Exception as e:
+        print(f"[WARN] No test split found ({e}); using train split as test.")
+        dataset_cam2worlds_test = list(dataset_cam2worlds)
+        dataset_target_imgs_test = list(dataset_target_imgs)
+        dataset_target_masks_test = list(dataset_target_masks)
+        dataset_intrinsics_per_frame_test = dataset_intrinsics_per_frame
 
 
 # # Voxel-hit analysis (Train vs Test)
@@ -1105,11 +1062,12 @@ with torch.no_grad():   # Deactivate Autograd
     if use_dataset:
         n_views = min(TEST_IMG_COUNT, len(dataset_cam2worlds_test))   # Use dataset camera poses
         print(f"[NVS] Using {n_views} dataset poses for novel view synthesis.")
+        psnr_list = []; ssim_list = []; lpips_list = []
         for idx, cam2world in enumerate(dataset_cam2worlds_test[:n_views]):
             cam2world_np = cam2world
             if use_mesh:    # render predicted RGB for pose
                 pred_rgb = render_via_mesh_rasterization_colorfield(
-                    color_field, cam2world_np, float(dataset_focal), IMG_RES, IMG_RES,
+                    color_field, cam2world_np, float(dataset_focal), H, W,
                     vertices, faces_unbatched, ctx, near=NEAR, far=FAR, device=DEVICE
                 ).cpu().numpy()
             else:
@@ -1136,6 +1094,9 @@ with torch.no_grad():   # Deactivate Autograd
                 psnr_val = compute_psnr(pred_rgb, gt_img)
                 ssim_val = ssim((pred_rgb*255).astype(np.uint8), (gt_img*255).astype(np.uint8), multichannel=True)
                 lpips_val = compute_lpips(pred_rgb, gt_img)
+                psnr_list.append(psnr_val)
+                ssim_list.append(ssim_val)
+                lpips_list.append(lpips_val)
                 fig, axs = plt.subplots(1, 2, figsize=(16,8), constrained_layout=True)
                 axs[0].imshow(np.clip(gt_img,0,1))
                 axs[0].set_title("Ground Truth")
@@ -1145,6 +1106,13 @@ with torch.no_grad():   # Deactivate Autograd
                 axs[1].axis("off")
                 plt.savefig(novel_out / f"compare_dataset_idx{idx:04d}.png")
                 plt.close()
+        
+        avg_psnr = sum(psnr_list) / len(psnr_list)
+        avg_ssim = sum(ssim_list) / len(ssim_list)
+        avg_lpips = sum(lpips_list) / len(lpips_list)
+        print(f"Average PSNR: {avg_psnr:.2f} dB")
+        print(f"Average SSIM: {avg_ssim:.4f}")
+        print(f"Average LPIPS: {avg_lpips:.4f}")
     else:
         # No dataset poses: fall back to angular trajectory (as before)
         novel_angles = [0, 60, 120, 180, 240, 300]
