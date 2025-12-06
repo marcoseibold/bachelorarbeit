@@ -113,7 +113,7 @@ def _list_all_images_under(root: str):
     def natural_key(s):  # sort 000.png < 10.png
         return [int(t) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
 
-    candidates = ["images_8", "images_4", "images_2", "images", "rgb", ""]
+    candidates = ["images_4", "images_8", "images_2", "images", "rgb", ""]
     exts = (".png", ".jpg", ".jpeg")
 
     for sub in candidates:
@@ -308,10 +308,14 @@ def _load_m360_raw(root: str, img_res: Optional[int], split: str):
 
             # Set res
             if img_res is None:
-                W = int(W0)
-                H = int(H0)
-                scale_x = 1.0
-                scale_y = 1.0
+                W_loaded, H_loaded = pil.size
+                if W0 is not None and H0 is not None and (W0 != 0 and H0 != 0):
+                    scale_x = float(W_loaded) / float(W0)
+                    scale_y = float(H_loaded) / float(H0)
+                else:
+                    scale_x = scale_y = 1.0
+                W = int(W_loaded)
+                H = int(H_loaded)
             else:
                 max_side = float(max(W0, H0))
                 if max_side <= img_res:
@@ -375,12 +379,20 @@ def _load_m360_raw(root: str, img_res: Optional[int], split: str):
 
     return cam2worlds, imgs, masks, focal_px, intr_per_frame
 
+# Dataset booleans
+nerf_synthetic = False
+m360 = False
+
 # Load NeRF-Synthetic or Mip-NeRF 360 dataset
-def load_dataset(data_root: str, img_res: Optional[int], split: str = "train"):
+def load_dataset(data_root: str, img_res: Optional[int]=None, split: str = "train"):
+    global nerf_synthetic, m360
+
     out = _load_nerf_synth(data_root, img_res, split)
     if out is not None:
+        nerf_synthetic = True
         return out
     out = _load_m360_raw(data_root, img_res, split)
     if out is not None:
+        m360 = True
         return out
     raise RuntimeError(f"No supported dataset found under {data_root} for split='{split}'.")
