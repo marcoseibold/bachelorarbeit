@@ -17,6 +17,7 @@ from scipy.ndimage import gaussian_filter, label    # occupancy filtering
 from skimage.metrics import structural_similarity as ssim
 import lpips
 import torchvision.transforms.functional as TF
+import gc
 
 import dataset_loader
 from tensorf_appearance import ColorFieldVM
@@ -38,7 +39,7 @@ parser.add_argument("--bbox_size", type=float, default=2.0, help="Scene bounding
 parser.add_argument("--n_samples", type=int, default=64, help="Samples per ray for volumetric rendering")
 parser.add_argument("--near", type=float, default=0.1, help="Near plane for ray sampling")  # 2.5 for m360 (counter, stump 1.0)
 parser.add_argument("--far", type=float, default=6.0, help="Far plane for ray sampling")    # 100.0 for m360
-parser.add_argument("--img_count", type=int, default=100, help="Training image count")
+parser.add_argument("--img_count", type=int, default=5, help="Training image count")
 parser.add_argument("--test_img_count", type=int, default=200, help="Test image count")
 args = parser.parse_args()
 
@@ -117,7 +118,7 @@ def world_to_grid_coords(pts):
     #print("grid range: (%.4f, %.4f)" % (grid.min().item(), grid.max().item()))
     return grid
 
-def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
+def render_via_mesh_rasterization_old(voxel_grid_param, cam2world_np, focal, H, W,
                                   vertices, faces_unbatched, ctx, voxel_sample_mode='bilinear',
                                   near=0.1, far=10.0, device='cuda'):
     # Create MVP (view-projection matrix) for rasterizing
@@ -179,18 +180,184 @@ def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
 
     return pred_rgb_aa
 
-def render_via_mesh_rasterization_colorfield_chunked(
+def render_via_mesh_rasterization(voxel_grid_param, cam2world_np, focal, H, W,
+                                  vertices, faces_unbatched, ctx, voxel_sample_mode='bilinear',
+                                  near=0.1, far=10.0, device='cuda'):
+    vertex_chunk=10_000_000
+    chunk_faces = 16_000_000
+    # Create MVP (view-projection matrix) for rasterizing
+    mvp_np = mvp_from_cam(cam2world_np, H, W, focal, near=near, far=far)  # numpy 4x4
+    #print("mvp_np shape:", mvp_np.shape, "\n", mvp_np)
+    mvp = torch.tensor(mvp_np, dtype=torch.float32, device=device).unsqueeze(0)  # [1,4,4]
+    #print("mvp tensor:", mvp.shape)
+
+    # Convert vertices (batched [1,V,3]) to [1,V,4] for homogeneous multiply
+    ones = torch.ones_like(vertices[:, :, :1])
+    verts_h = torch.cat([vertices, ones], dim=-1)  # [1,V,4]
+    #print("verts_h:", verts_h.shape, "example:", verts_h[0, 0])
+
+    # pos_clip: multiply vertices with mvp (transpose to match shapes, vertices in clip-space)
+    B, V, _ = verts_h.shape
+
+    # Chunk verts * mvp -> pos_clip
+    mvp_t = mvp[0].transpose(0, 1).contiguous().to(device=device, dtype=torch.float32)  # [4,4]
+    vertex_chunk = int(min(vertex_chunk, V))
+    pos_clip = torch.empty((1, V, 4), device=device, dtype=torch.float32)
+
+    # pos_clip in chunks
+    with torch.no_grad():
+        for start in range(0, V, vertex_chunk):
+            end = min(start + vertex_chunk, V)
+            v_slice2d = verts_h[:, start:end, :].contiguous().view(-1, 4)  # [chunk,4]
+            out2d = v_slice2d.mm(mvp_t)                                     # [chunk,4]
+            pos_clip[:, start:end, :] = out2d.view(1, end - start, 4)
+            del v_slice2d, out2d
+
+    pos_clip = pos_clip.contiguous().float()   # final pos_clip [1,V,4]
+    #print("pos_clip:", pos_clip.shape)
+
+    # rasterize -> rast_out
+    #print("rast_out:", rast_out.shape)
+
+    # interpolate world-space positions (vertices are world coords)
+    #print("pos_map:", pos_map.shape, "range:", pos_map.min().item(), pos_map.max().item())
+
+    # convert world pos to voxel grid coords in [-1,1]
+    #print("grid_coords range:", grid_coords.min().item(), grid_coords.max().item())
+    # make sampling grid shape [1,1,H,W,3] for grid_sample
+
+    # sample/query voxel grid: voxel_grid_param is [1,C,D,H,W]
+    #print("sampled:", sampled.shape)
+    # Reorder and squeeze dimensions
+
+    F_total = faces_unbatched.shape[0]
+    faces = faces_unbatched.contiguous().to(device=device, dtype=torch.int32)
+
+    device = pos_clip.device
+    dtype  = pos_clip.dtype
+    P = H * W
+
+    # Output buffers
+    if dataset_loader.nerf_synthetic:
+        color_buffer = torch.ones((1, H, W, 3), device=device, dtype=dtype)
+    else:
+        color_buffer = torch.zeros((1, H, W, 3), device=device, dtype=dtype)
+
+    depth_buffer = torch.full((1, H, W, 1), float('inf'),
+                            device=device, dtype=dtype)
+
+    vertex_positions = vertices[0].float().unsqueeze(0)
+
+    # face-chunk loop
+    for s in range(0, F_total, chunk_faces):
+        e = min(s + chunk_faces, F_total)
+        f_chunk = faces[s:e]
+
+        gc.collect()
+        torch.cuda.synchronize()
+
+        # Rasterize
+        rast_chunk, _ = dr.rasterize(ctx, pos_clip, f_chunk,
+                                    resolution=[H, W])
+
+        # Interpolate clip coords for depth
+        interp_clip, _ = dr.interpolate(pos_clip, rast_chunk, f_chunk)
+        w = interp_clip[..., 3:4]
+        depth_ndc = interp_clip[..., 2:3] / (w + 1e-9)
+
+        # Interpolate world positions
+        interp_pos, _ = dr.interpolate(vertex_positions,
+                                    rast_chunk, f_chunk)
+
+        valid = (rast_chunk[..., 3] > 0).unsqueeze(-1)
+        closer = valid & (depth_ndc < depth_buffer)
+
+        if closer.any():
+            idx = closer.view(-1).nonzero(as_tuple=False).squeeze(-1)
+
+            # gather world positions
+            interp_pos_flat = interp_pos.view(1, P, 3)[0]
+            chosen_xyz = interp_pos_flat[idx]  # [M,3]
+
+            # world -> grid coords [-1,1]
+            grid_coords = world_to_grid_coords(chosen_xyz)
+            grid = grid_coords.view(1, 1, -1, 1, 3)
+
+            # sample voxel grid
+            sampled = F.grid_sample(
+                voxel_grid_param,
+                grid,
+                mode=voxel_sample_mode,
+                padding_mode='border',
+                align_corners=True
+            )  # [1,C,1,M,1]
+
+            rgb = sampled[0, :3, 0, :, 0].permute(1, 0)
+            rgb = torch.clamp(rgb, 0.0, 1.0)
+
+            # write color
+            color_flat = color_buffer.view(1, P, 3)[0]
+            color_flat[idx] = rgb
+            color_buffer = color_flat.view(1, H, W, 3)
+
+            # update depth
+            depth_flat = depth_buffer.view(1, P, 1)[0]
+            depth_flat[idx, 0] = depth_ndc.view(-1)[idx]
+            depth_buffer = depth_flat.view(1, H, W, 1)
+
+        del rast_chunk, interp_clip, interp_pos
+
+    # Pick first 3 channels of voxel grid as RGB
+    #print("pred_rgb:", pred_rgb.shape)
+
+    # Set background to white
+    
+    if not dataset_loader.nerf_synthetic:
+        # hit mask = pixels with finite depth
+        hit_mask = (depth_buffer[0, ..., 0] < float('inf'))   # [H,W], bool
+        hit_mask_flat = hit_mask.view(-1)
+        color_flat = color_buffer.view(1, P, 3)[0]  # [P,3]
+
+        if hit_mask.any():
+            # compute mean color over hit pixels
+            hit_colors = color_flat[hit_mask_flat]
+            mean_color = hit_colors.mean(dim=0)  # [3]
+        else:
+            # fallback: mean over entire buffer
+            mean_color = color_flat.mean(dim=0)
+
+        # assign mean_color to all non-hit pixels
+        nonhit_idx = (~hit_mask_flat).nonzero(as_tuple=False).squeeze(-1)
+        if nonhit_idx.numel() > 0:
+            color_flat[nonhit_idx] = mean_color.unsqueeze(0).expand(nonhit_idx.numel(), 3)
+            color_buffer = color_flat.view(1, H, W, 3)
+
+    # final image
+    pred_rgb = color_buffer[0].permute(1, 2, 0)  # [H,W,3]
+    pred_rgb = pred_rgb.permute(2, 0, 1).contiguous()
+
+    if dataset_loader.m360:
+        pred_rgb = torch.flip(pred_rgb, dims=[1])   # for m360
+        
+    # Antialiasing
+    # pred_rgb_batched = pred_rgb.unsqueeze(0).contiguous().float() # [1,H,W,3]
+    # rast_aa = rast_out.contiguous().float()
+    # pos_clip_aa = pos_clip.contiguous().float()
+    # pred_rgb_aa = dr.antialias(pred_rgb_batched, rast_aa, pos_clip_aa, faces_unbatched)[0]
+
+    return pred_rgb
+
+def render_via_mesh_rasterization_colorfield_old(
     color_field, cam2world_np, focal, H, W,
     vertices, faces_unbatched, ctx,
     near=0.1, far=10.0, device='cuda'):
-    vertex_chunk = 100000
     # Create MVP, convert to tensor
     mvp_np = mvp_from_cam(cam2world_np, H, W, focal, near=near, far=far)
     mvp = torch.tensor(mvp_np, dtype=torch.float32, device=device).unsqueeze(0)
     # Rasterize homogene vertices converted to clip space
     ones = torch.ones_like(vertices[:, :, :1])
     verts_h = torch.cat([vertices, ones], dim=-1)   # [1,V,4]
-
+    vertex_chunk = 100000
     V = verts_h.shape[1]
     pos_clip_chunks = []
 
@@ -203,96 +370,8 @@ def render_via_mesh_rasterization_colorfield_chunked(
 
     pos_clip = torch.cat(pos_clip_chunks, dim=1).to(device=device, dtype=torch.float32).contiguous()
     del pos_clip_chunks
-    #pos_clip = pos_clip.to('cuda', dtype=torch.float32).contiguous()
+
     #pos_clip = torch.matmul(verts_h, mvp.transpose(1, 2))   # [1,V,4]
-    
-    F = faces_unbatched.shape[0]
-
-    face_chunk = 200000
-    eps=1e-5
-    faces_unbatched = faces_unbatched.to(device=device, dtype=torch.int32).contiguous()
-
-    rgb_accum = torch.zeros((1, H, W, 3), device=device, dtype=torch.float32)
-    weight_accum = torch.zeros((1, H, W, 1), device=device, dtype=torch.float32)
-    
-    for fs in range(0, F, face_chunk):
-        fe = min(fs + face_chunk, F)
-        faces_sub = faces_unbatched[fs:fe]#.to(torch.int32)  # (chunk size, 3)
-        
-        rast_sub, _ = dr.rasterize(
-            ctx,
-            pos_clip.float(),
-            faces_sub,
-            resolution=[H, W]
-        )
-
-        # ----- STEP 5: Z-Buffer-basierter Merge
-        depth = rast_sub[..., 2:3]   # z-buffer
-        alpha = rast_sub[..., 3:4].clamp(min=0.0, max=1.0)
-
-        pos_map, _ = dr.interpolate(vertices[0].float(), rast_sub, faces_sub)
-        pos_map = pos_map.unsqueeze(0)  # [1,H,W,3]
-
-        cam_pos = torch.tensor(cam2world_np[:3, 3], dtype=torch.float32, device=device).view(1,1,1,3)
-        viewdirs = cam_pos - pos_map
-        viewdirs = viewdirs / (viewdirs.norm(dim=-1, keepdim=True) + 1e-8)
-        P = H * W   # Convert to lists:
-        xyz_flat = pos_map.reshape(P, 3)
-        vdir_flat = viewdirs.reshape(P, 3)
-        rgb_chunk = color_field(xyz_flat, vdir_flat).view(1, H, W, 3)
-
-        # --- Soft Merge: weight = alpha / (depth + eps)
-        weight = alpha / (depth + eps)
-        rgb_accum = rgb_accum + rgb_chunk * weight
-        weight_accum = weight_accum + weight
-
-    # rast_out = final_rast
-    # # World positions per pixel
-    # pos_map, _ = dr.interpolate(vertices[0].float(), rast_out, faces_unbatched)  # [1,H,W,3]
-    # pos_map = pos_map[0]    # [H,W,3]
-    # # Get view-direction (point -> camera)
-    # cam_pos = torch.tensor(cam2world_np[:3, 3], dtype=torch.float32, device=device)  # [3]
-    # viewdirs = cam_pos.view(1,1,3) - pos_map    # camera - world coords [H,W,3]
-    # viewdirs = viewdirs / (viewdirs.norm(dim=-1, keepdim=True) + 1e-8)  # normalize
-    # # Mask
-    # # mask = (rast_out[0, ..., 3] > 0)    # [H,W]
-    # P = H * W   # Convert to lists:
-    # xyz = pos_map.reshape(P, 3) # World points
-    # vdir = viewdirs.reshape(P, 3)   # Normalized view directions
-    # Only use visible pixels
-    #valid_idx = mask.reshape(-1).nonzero(as_tuple=False).squeeze(-1)    # [M]
-    # rgb_out = torch.ones((P, 3), device=device, dtype=torch.float32)    # white background
-    # if valid_idx.numel() > 0:
-    #     rgb_valid = color_field(xyz[valid_idx], vdir[valid_idx])    # RGB in [M,3]
-    #     rgb_out[valid_idx] = torch.clamp(rgb_valid, 0.0, 1.0)   # Clamp
-    #rgb_out = torch.full((P, 3), float('nan'), device=device, dtype=torch.float32)
-    #if valid_idx.numel() > 0:
-        # rgb_valid = color_field(xyz[valid_idx], vdir[valid_idx])
-        # rgb_out[valid_idx] = rgb_valid
-    # rgb = color_field(xyz, vdir)
-    rgb_final = rgb_accum / (weight_accum + 1e-8)
-    #img = rgb.view(H, W, 3) # [H,W,3]
-    if dataset_loader.m360:
-        img = torch.flip(rgb_final, dims=[0]) # only for m360
-    # Antialiasing
-    rast_out = torch.zeros((1,H,W,4), device=device, dtype=torch.float32)
-    rast_out[..., 3:4] = torch.clamp(weight_accum, 0.0, 1.0)
-    img_aa = dr.antialias(img, rast_out, pos_clip.contiguous().float(), faces_unbatched)[0]
-    img_aa = torch.flip(img_aa, dims=[1])  # [1,H,W,3] -> Flip H
-
-    return img_aa    # [H,W,3]
-
-def render_via_mesh_rasterization_colorfield(
-    color_field, cam2world_np, focal, H, W,
-    vertices, faces_unbatched, ctx,
-    near=0.1, far=10.0, device='cuda'):
-    # Create MVP, convert to tensor
-    mvp_np = mvp_from_cam(cam2world_np, H, W, focal, near=near, far=far)
-    mvp = torch.tensor(mvp_np, dtype=torch.float32, device=device).unsqueeze(0)
-    # Rasterize homogene vertices converted to clip space
-    ones = torch.ones_like(vertices[:, :, :1])
-    verts_h = torch.cat([vertices, ones], dim=-1)   # [1,V,4]
-    pos_clip = torch.matmul(verts_h, mvp.transpose(1, 2))   # [1,V,4]
     rast_out, _ = dr.rasterize(ctx, pos_clip.float(), faces_unbatched, resolution=[H, W])
     # World positions per pixel
     pos_map, _ = dr.interpolate(vertices[0].float(), rast_out, faces_unbatched)  # [1,H,W,3]
@@ -330,6 +409,171 @@ def render_via_mesh_rasterization_colorfield(
     img_aa = dr.antialias(img_batched, rast_out, pos_clip_aa, faces_unbatched)[0]
 
     return img_aa    # [H,W,3]
+
+def render_via_mesh_rasterization_colorfield(
+    color_field, cam2world_np, focal, H, W,
+    vertices, faces_unbatched, ctx,
+    near=0.1, far=10.0, device='cuda'):
+    chunk_faces=16_000_000
+    vertex_chunk=10_000_000
+    # --- Build MVP and verts_h (homogeneous) ---
+    mvp_np = mvp_from_cam(cam2world_np, H, W, focal, near=near, far=far)
+    mvp = torch.tensor(mvp_np, dtype=torch.float32, device=device).unsqueeze(0)  # [1,4,4]
+
+    ones = torch.ones_like(vertices[:, :, :1])
+    verts_h = torch.cat([vertices, ones], dim=-1)   # [1, V, 4]
+    B, V, _ = verts_h.shape
+
+    # Chunk verts * mvp -> pos_clip
+    mvp_t = mvp[0].transpose(0, 1).contiguous().to(device=device, dtype=torch.float32)  # [4,4]
+    vertex_chunk = int(min(vertex_chunk, V))
+    pos_clip = torch.empty((1, V, 4), device=device, dtype=torch.float32)
+
+    # pos_clip in chunks
+    with torch.no_grad():
+        for start in range(0, V, vertex_chunk):
+            end = min(start + vertex_chunk, V)
+            v_slice2d = verts_h[:, start:end, :].contiguous().view(-1, 4)  # [chunk,4]
+            out2d = v_slice2d.mm(mvp_t)                                     # [chunk,4]
+            pos_clip[:, start:end, :] = out2d.view(1, end - start, 4)
+            del v_slice2d, out2d
+
+    pos_clip = pos_clip.contiguous().float()   # final pos_clip [1,V,4]
+
+    device = pos_clip.device
+    dtype = pos_clip.dtype
+
+    F_total = faces_unbatched.shape[0]
+    faces = faces_unbatched.contiguous().to(device=device, dtype=torch.int32)
+    vertex_positions = vertices[0].float().unsqueeze(0).to(device=device, dtype=dtype)  # [1,V,3]
+
+    # Buffers
+    if dataset_loader.nerf_synthetic:
+        # white background
+        color_buffer = torch.ones((1, H, W, 3), device=device, dtype=dtype)
+    else:
+        color_buffer = torch.zeros((1, H, W, 3), device=device, dtype=dtype)
+
+
+    depth_buffer = torch.full((1, H, W, 1), float('inf'), device=device, dtype=dtype)
+
+    # camera position (for viewdir)
+    cam_pos = torch.tensor(cam2world_np[:3, 3], dtype=torch.float32, device=device)
+    P = H * W
+
+    # --- build per-pixel ray directions in world space ---
+    i, j = torch.meshgrid(
+        torch.arange(W, device=device),
+        torch.arange(H, device=device)
+    )
+
+    dirs_cam = torch.stack([
+        (i - W * 0.5) / focal,
+        -(j - H * 0.5) / focal,
+        -torch.ones_like(i)
+    ], dim=-1)  # [H,W,3]
+
+    R = torch.tensor(cam2world_np[:3, :3], device=device, dtype=dtype)
+    dirs_world = (dirs_cam @ R.T)
+    dirs_world = dirs_world / (dirs_world.norm(dim=-1, keepdim=True) + 1e-8)
+
+    dirs_world_flat = dirs_world.view(-1, 3)  # [P,3]
+
+    # iterate face chunks
+    for s in range(0, F_total, chunk_faces):
+        e = min(s + chunk_faces, F_total)
+        f_chunk = faces[s:e].contiguous()  # [chunk,3]
+
+        gc.collect()
+        torch.cuda.synchronize()
+
+        # rasterize chunk
+        rast_chunk, _ = dr.rasterize(ctx, pos_clip, f_chunk, resolution=[H, W])
+
+        # interpolate clip coords (for depth) and world positions
+        interp_clip_chunk, _ = dr.interpolate(pos_clip, rast_chunk, f_chunk)    # [1,H,W,4]
+        interp_pos_chunk, _ = dr.interpolate(vertex_positions, rast_chunk, f_chunk)  # [1,H,W,3]
+
+        # depth_ndc = z / w
+        w_comp = interp_clip_chunk[..., 3:4]
+        depth_ndc = interp_clip_chunk[..., 2:3] / (w_comp + 1e-9)  # [1,H,W,1]
+
+        # valid fragments mask (coverage > 0)
+        valid_mask = (rast_chunk[..., 3] > 0.0).unsqueeze(-1)  # [1,H,W,1]
+
+        # closer fragments than current
+        closer_mask = (depth_ndc < depth_buffer) & valid_mask  # [1,H,W,1]
+
+        if closer_mask.any():
+            # flatten indices of pixels that changed
+            mask_flat = closer_mask.view(-1)       # length P
+            idxs = mask_flat.nonzero(as_tuple=False).squeeze(-1)  # indices in flattened P
+
+            if idxs.numel() > 0:
+                # gather world positions for those pixels
+                interp_pos_flat = interp_pos_chunk.view(1, P, 3)[0]   # [P,3]
+                chosen_xyz = interp_pos_flat[idxs]                    # [M,3]
+
+                # compute viewdirs
+                cam_pos_expand = cam_pos.view(1, 3)
+                viewdirs_chosen = cam_pos_expand - chosen_xyz
+                viewdirs_chosen = viewdirs_chosen / (viewdirs_chosen.norm(dim=-1, keepdim=True) + 1e-8)
+
+                # sample color field
+                rgb_chosen = color_field(chosen_xyz, viewdirs_chosen)  # [M,3]
+                rgb_chosen = torch.clamp(rgb_chosen, 0.0, 1.0)
+
+                # write colors back
+                color_flat = color_buffer.view(1, P, 3)[0]   # [P,3]
+                color_flat[idxs, :] = rgb_chosen
+                color_buffer = color_flat.view(1, H, W, 3)
+
+                # update depth buffer at these indices
+                depth_flat = depth_buffer.view(1, P, 1)[0]  # [P,1]
+                depth_flat[idxs, 0] = depth_ndc.view(-1)[idxs]
+                depth_buffer = depth_flat.view(1, H, W, 1)
+
+        # free temps
+        del interp_clip_chunk, interp_pos_chunk, w_comp, depth_ndc, valid_mask, closer_mask
+
+    if not dataset_loader.nerf_synthetic:
+        hit_mask = (depth_buffer[0, ..., 0] < float('inf'))
+        hit_mask_flat = hit_mask.view(-1)
+
+        nonhit_idx = (~hit_mask_flat).nonzero(as_tuple=False).squeeze(-1)
+
+        if nonhit_idx.numel() > 0:
+            # View directions
+            viewdirs_bg = -dirs_world_flat[nonhit_idx]  # towards camera
+
+            # FIXED xyz -> decouple background from scene geometry
+            xyz_bg = cam_pos.view(1, 3).expand(viewdirs_bg.shape[0], 3)
+            # alternative:
+            # xyz_bg = torch.zeros_like(viewdirs_bg)
+
+            rgb_bg = color_field(xyz_bg, viewdirs_bg)
+            rgb_bg = torch.clamp(rgb_bg, 0.0, 1.0)
+
+            color_flat = color_buffer.view(1, P, 3)[0]
+            color_flat[nonhit_idx] = rgb_bg
+            color_buffer = color_flat.view(1, H, W, 3)
+
+    # final image
+    img = color_buffer[0].permute(1, 2, 0)  # [H,W,3]
+    img = img.permute(2, 0, 1).contiguous()
+
+    if dataset_loader.m360:
+        img = torch.flip(img, dims=[1])
+
+    # Antialiasing
+    # img_batched = img.unsqueeze(0).contiguous().float()  # [1,H,W,3]
+    # #rast_aa    = rast_out.contiguous().float()
+    # pos_clip_aa = pos_clip.contiguous().float()
+    # img_aa = dr.antialias(img_batched, rast_chunk, pos_clip_aa, faces_unbatched)[0]
+
+    return img  # [H,W,3]
+
+
 
 # ---------------- Prepare scene (mesh or bbox) & load dataset if requested ----------------
 if DATA_ROOT is not None:
@@ -389,10 +633,6 @@ if MESH_PATH is not None:
 
     if not isinstance(mesh, trimesh.Trimesh):   # Make sure mesh is a trimesh
         raise TypeError("Expected trimesh.Trimesh")
-    
-    target_faces = 1000000
-    # mesh = mesh.simplify_quadratic_decimation(target_faces)
-    # mesh.export("simplified.obj")
 
     mesh_vertices = mesh.vertices.astype(np.float32)    # Convert to float32
     mesh.vertices = mesh_vertices
@@ -532,6 +772,8 @@ best_loss = float('inf'); no_improve_steps = 0
 # print("voxel_grid shape:", vg.shape)   # [1, C, D, H, W]
 # print("device:", vg.device, "dtype:", vg.dtype)
 # print("min/max/mean/std:", vg.min().item(), vg.max().item(), vg.mean().item(), vg.std().item())
+
+start_time = time.time()
 
 print("[TRAIN] Start training...")
 scaler = torch.cuda.amp.GradScaler()    # Initialize GradScaler for AMP
@@ -711,6 +953,14 @@ for it in range(1, STEPS+1):
 
 tb_writer.close()   # Close tensorboard
 print("Training finished. Results in:", OUTDIR)
+
+end_time = time.time()
+training_time = end_time - start_time
+hours, rem = divmod(training_time, 3600)
+minutes, seconds = divmod(rem, 60)
+print(f"Training duration: {int(hours)}:{int(minutes):02d}:{seconds:.2f}")
+
+print(f"GPU Memory Peak: {torch.cuda.max_memory_allocated() / 1024**2:.2f} MB")
 
 # Novel View Synthesis
 print("[NVS] Rendering novel views...")
