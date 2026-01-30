@@ -1,4 +1,4 @@
-name: nvdiffrast
+name: meshing_splats
 channels:
   - pytorch
   - defaults
