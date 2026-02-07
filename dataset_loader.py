@@ -3,6 +3,9 @@ from typing import Optional, List, Tuple, Dict
 import numpy as np
 from PIL import Image
 import re
+import struct
+from collections import namedtuple
+from pathlib import Path
 
 Array = np.ndarray
 
@@ -104,32 +107,64 @@ def _load_nerf_synth(root: str, img_res: Optional[int], split: str):
 
 # Mip-NeRF 360 (COLMAP / LLFF)
 
+M360_IMAGE_SCALE = {
+    # Outdoor
+    "bicycle": 4,
+    "garden": 4,
+    "stump": 4,
+
+    # Indoor
+    "bonsai": 2,
+    "counter": 2,
+    "kitchen": 2,
+    "room": 2,
+}
+
+def _infer_scene_name(root: str) -> str:
+    return os.path.basename(os.path.normpath(root))
+
 def _natural_key(s: str):
     return [int(t) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
 
-def _list_all_images_under(root: str):
-    # pick images (lowest res first)
-    import os, re
-    def natural_key(s):  # sort 000.png < 10.png
-        return [int(t) if t.isdigit() else t.lower() for t in re.findall(r'\d+|\D+', s)]
-
-    candidates = ["images_4", "images_8", "images_2", "images", "rgb", ""]
+def _list_all_images_under(root: str, preferred_scale: Optional[int] = None):
+    """
+    If preferred_scale is given (e.g. 2 or 4), try images_<scale>/ first.
+    Otherwise fall back to heuristic order.
+    """
     exts = (".png", ".jpg", ".jpeg")
+
+    def natural_key(s):
+        return [int(t) if t.isdigit() else t.lower()
+                for t in re.findall(r'\d+|\D+', s)]
+
+    candidates = []
+
+    if preferred_scale is not None:
+        candidates.append(f"images_{preferred_scale}")
+
+    # fallback order
+    candidates += ["images_4", "images_8", "images_2", "images", "rgb", ""]
 
     for sub in candidates:
         folder = os.path.join(root, sub)
         if not os.path.isdir(folder):
             continue
-        files = [os.path.join(folder, f)
-                 for f in sorted(os.listdir(folder), key=natural_key)
-                 if os.path.splitext(f)[1].lower() in exts]
+
+        files = [
+            os.path.join(folder, f)
+            for f in sorted(os.listdir(folder), key=natural_key)
+            if os.path.splitext(f)[1].lower() in exts
+        ]
+
         if files:
             print(f"[INFO] Using images from '{sub}/' ({len(files)} files)")
             return files
 
     raise FileNotFoundError(
-        f"No image folders found under {root} (checked images_[8,4,2], images/, rgb/)"
+        f"No image folders found under {root} "
+        f"(checked images_[2|4|8], images/, rgb/)"
     )
+
 
 
 def _read_noncomment_lines(path: str):
@@ -202,7 +237,7 @@ def _try_load_llff_poses_bounds(root: str):
         pose = row[:15].reshape(3,5).astype(np.float32)  # [R|t|h,w,f]
         R = pose[:,:3]; t = pose[:,3]; h,w,f = pose[:,4]
         c2w = np.eye(4, dtype=np.float32); c2w[:3,:3] = R; c2w[:3,3] = t
-        theta = -np.pi * 0.5  # test +np.pi*0.5
+        theta = -np.pi * 0.5
         Rz = np.array([[ np.cos(theta), -np.sin(theta), 0],
                     [ np.sin(theta),  np.cos(theta), 0],
                     [ 0,               0,            1]], dtype=np.float32)
@@ -227,6 +262,12 @@ def _find_image_for_name(root: str, name: str) -> Optional[str]:
     return None
 
 def _load_m360_raw(root: str, img_res: Optional[int], split: str):
+    scene = _infer_scene_name(root)
+    preferred_scale = M360_IMAGE_SCALE.get(scene, None)
+
+    if preferred_scale is not None:
+        print(f"[INFO] MipNeRF360 scene '{scene}': forcing images_{preferred_scale}/")
+
     # Load frames (LLFF oder COLMAP)
     frames = _try_load_llff_poses_bounds(root)
     if frames is None:
@@ -238,7 +279,7 @@ def _load_m360_raw(root: str, img_res: Optional[int], split: str):
     for idx, fr in enumerate(frames):
         fr["_idx"] = idx
 
-    # Split per train.txt/test.txt, else 80/20
+    # Split per train.txt/test.txt
     lst = _read_split_list(root, split)
     if lst is not None:
         # Split via train.txt/test.txt
@@ -280,7 +321,7 @@ def _load_m360_raw(root: str, img_res: Optional[int], split: str):
             # LLFF/poses_bounds.npy
             if "_LLFF_IMAGE_LIST_CACHE" not in globals():
                 # Get all images
-                imgs_all = _list_all_images_under(root)
+                imgs_all = _list_all_images_under(root, preferred_scale)
                 globals()["_LLFF_IMAGE_LIST_CACHE"] = imgs_all
                 if not imgs_all:
                     raise FileNotFoundError(
@@ -379,13 +420,162 @@ def _load_m360_raw(root: str, img_res: Optional[int], split: str):
 
     return cam2worlds, imgs, masks, focal_px, intr_per_frame
 
+def qvec2rotmat(q):
+    w, x, y, z = q
+    return np.array([
+        [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+        [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+        [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]
+    ], dtype=np.float32)
+
+CAMERA_MODEL_NUM_PARAMS = {
+    0: 3,   # SIMPLE_PINHOLE
+    1: 4,   # PINHOLE
+    2: 4,   # SIMPLE_RADIAL
+    3: 5,   # RADIAL
+    4: 8,   # OPENCV
+    5: 8,   # OPENCV_FISHEYE
+    6: 12,  # FULL_OPENCV
+}
+
+
+def read_cameras_binary(path):
+    cams = {}
+    with open(path, "rb") as fid:
+        num_cams = struct.unpack('<Q', fid.read(8))[0]
+
+        for _ in range(num_cams):
+            cam_id = struct.unpack('<i', fid.read(4))[0]
+            model  = struct.unpack('<i', fid.read(4))[0]
+            width  = struct.unpack('<Q', fid.read(8))[0]
+            height = struct.unpack('<Q', fid.read(8))[0]
+
+            if model not in CAMERA_MODEL_NUM_PARAMS:
+                raise ValueError(f"Unknown COLMAP camera model {model}")
+
+            num_params = CAMERA_MODEL_NUM_PARAMS[model]
+
+            params = np.frombuffer(
+                fid.read(8 * num_params),
+                dtype=np.float64
+            ).astype(np.float32)
+
+            cams[cam_id] = {
+                "model": model,
+                "w": width,
+                "h": height,
+                "params": params
+            }
+    return cams
+
+
+def read_images_binary(path):
+    images = []
+    with open(path, "rb") as fid:
+        num_images = struct.unpack('<Q', fid.read(8))[0]
+
+        for _ in range(num_images):
+            image_id = struct.unpack('<i', fid.read(4))[0]
+
+            qvec = np.array(
+                struct.unpack('<4d', fid.read(32)),
+                dtype=np.float64
+            )
+            tvec = np.array(
+                struct.unpack('<3d', fid.read(24)),
+                dtype=np.float64
+            )
+
+            cam_id = struct.unpack('<i', fid.read(4))[0]
+
+            name_bytes = []
+            while True:
+                c = fid.read(1)
+                if c == b'\x00':
+                    break
+                name_bytes.append(c)
+            name = b''.join(name_bytes).decode('utf-8')
+
+            # Points2D
+            num_points2D = struct.unpack('<Q', fid.read(8))[0]
+            fid.seek(num_points2D * (8 + 8 + 8), 1)
+
+            images.append({
+                "image_id": image_id,
+                "qvec": qvec,
+                "tvec": tvec,
+                "cam_id": cam_id,
+                "name": name
+            })
+
+    return images
+
+def _load_tnt_raw(root: str, img_res: int=None, split="train"):
+    cam_bin = Path(root)/"sparse/0/cameras.bin"
+    img_bin = Path(root)/"sparse/0/images.bin"
+    cams = read_cameras_binary(cam_bin)
+    images = read_images_binary(img_bin)
+    images = sorted(images, key=lambda im: im["name"])
+
+    split_list = _read_split_list(root, split)
+    if split_list is not None:
+        images = [im for im in images if im["name"] in split_list]
+    else:
+        if split == "train":
+            images = [im for i, im in enumerate(images) if (i % 8) != 0]
+        else:  # split == "test"
+            images = [im for i, im in enumerate(images) if (i % 8) == 0]
+
+    cam2worlds, imgs, masks, intr_per_frame = [], [], [], []
+    for im in images:
+        c = cams[im["cam_id"]]
+        R_wc = qvec2rotmat(im["qvec"])  # world -> cam
+        t_wc = im["tvec"].astype(np.float32)
+
+        # world -> cam
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[:3, :3] = R_wc
+        w2c[:3, 3] = t_wc
+
+        # cam -> world
+        c2w = np.linalg.inv(w2c)
+
+        # COLMAP -> NeRF coordinate system
+        colmap_to_nerf = np.array([
+            [ 1,  0,  0,  0],
+            [ 0, -1,  0,  0],
+            [ 0,  0, -1,  0],
+            [ 0,  0,  0,  1],
+        ], dtype=np.float32)
+
+        c2w = c2w @ colmap_to_nerf
+        c2w[:3, 1] *= -1
+
+        cam2worlds.append(c2w)
+
+        img_path = Path(root)/"images"/im["name"]
+        pil = Image.open(img_path).convert("RGB")
+        if img_res is not None:
+            pil = pil.resize((img_res, img_res), Image.LANCZOS)
+        arr = np.array(pil).astype(np.float32)/255.0
+        imgs.append(arr)
+        masks.append(np.ones(arr.shape[:2], dtype=np.float32))
+        fx = fy = c["params"][0] if len(c["params"])>0 else 1.0
+        cx = c.get("w", arr.shape[1])/2
+        cy = c.get("h", arr.shape[0])/2
+        intr_per_frame.append({"fx":fx,"fy":fy,"cx":cx,"cy":cy,"W":arr.shape[1],"H":arr.shape[0]})
+
+    focal_px = float(np.mean([i["fx"] for i in intr_per_frame]))
+    return cam2worlds, imgs, masks, focal_px, intr_per_frame
+
 # Dataset booleans
 nerf_synthetic = False
 m360 = False
+tnt = False
 
-# Load NeRF-Synthetic or Mip-NeRF 360 dataset
+# Load NeRF-Synthetic, Mip-NeRF 360 or Tanks & Temples dataset
 def load_dataset(data_root: str, img_res: Optional[int]=None, split: str = "train"):
-    global nerf_synthetic, m360
+    global nerf_synthetic, m360, tnt
 
     out = _load_nerf_synth(data_root, img_res, split)
     if out is not None:
@@ -394,5 +584,9 @@ def load_dataset(data_root: str, img_res: Optional[int]=None, split: str = "trai
     out = _load_m360_raw(data_root, img_res, split)
     if out is not None:
         m360 = True
+        return out
+    out = _load_tnt_raw(data_root, img_res, split)
+    if out is not None:
+        tnt = True
         return out
     raise RuntimeError(f"No supported dataset found under {data_root} for split='{split}'.")

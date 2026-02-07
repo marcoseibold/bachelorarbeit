@@ -161,8 +161,7 @@ class ColorFieldVM(FieldBase):
     def normalize_coord(self, xyz_sampled: torch.Tensor) -> torch.Tensor:
         xyz_normalized = xyz_sampled / self.scene_extent
         xyz_contracted = mipnerf_360_contraction(xyz_normalized, t=0.5) 
-        #print(f"Min: {xyz_normalized.min().item()}, Max: {xyz_normalized.max().item()}")
-        return torch.clamp(xyz_contracted, -1.0, 1.0)
+        return xyz_contracted
 
     # Pick renderer (Only SH)
     def define_modules(self):

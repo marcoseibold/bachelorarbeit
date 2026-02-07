@@ -5,9 +5,9 @@ from scipy.spatial import cKDTree
 import matplotlib
 import matplotlib.pyplot as plt
 
-# Geometry evaluation script for Nerf-Synthetic calculating CD and F1-Score of GT and extracted meshes
+# Geometry evaluation script for Nerf-Synthetic calculating Chamfer Distance, F1-score, Completeness, Accuracy and Normal Alignment of GT and extracted meshes
 
-np.random.seed(42)
+np.random.seed(42)  # Set seed for same results
 
 # Sample mesh
 def sample_geometry(path: str, n_samples: int) -> np.ndarray:
@@ -36,46 +36,6 @@ def sample_geometry(path: str, n_samples: int) -> np.ndarray:
         normals = np.zeros_like(verts)
         return verts, normals
 
-# Optionally visualize point clouds for debugging
-def save_pointcloud_visualization(
-    A: np.ndarray,
-    B: np.ndarray,
-    out_path: str,
-    max_points: int = 5000,
-):
-    # Subsampling for plots
-    idxA = np.random.choice(len(A), min(max_points, len(A)), replace=False)
-    idxB = np.random.choice(len(B), min(max_points, len(B)), replace=False)
-
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection="3d")
-
-    ax.scatter(
-        A[idxA, 0], A[idxA, 1], A[idxA, 2],
-        s=2, c="red", alpha=0.6, label="Reconstruction"
-    )
-    ax.scatter(
-        B[idxB, 0], B[idxB, 1], B[idxB, 2],
-        s=2, c="green", alpha=0.3, label="GT"
-    )
-
-    ax.set_title("Point Cloud Alignment")
-    ax.set_axis_off()
-    ax.legend(loc="upper right")
-
-    # Same axis scaling
-    all_pts = np.concatenate([A, B], axis=0)
-    mins = all_pts.min(axis=0)
-    maxs = all_pts.max(axis=0)
-    ax.set_xlim(mins[0], maxs[0])
-    ax.set_ylim(mins[1], maxs[1])
-    ax.set_zlim(mins[2], maxs[2])
-
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
-    plt.close(fig)
-
-
 # Calculate chamfer distance
 def chamfer_distance(x: np.ndarray, y: np.ndarray) -> float:
     tree_y = cKDTree(y)
@@ -86,7 +46,7 @@ def chamfer_distance(x: np.ndarray, y: np.ndarray) -> float:
 
     return 0.5 * float(d_xy.mean() + d_yx.mean())
 
-# Calculate F1-score of two point clouds
+# Calculate F1-score
 def f1_score_pointclouds(
     x: np.ndarray,
     y: np.ndarray,
@@ -106,6 +66,7 @@ def f1_score_pointclouds(
 
     return float(2 * precision * recall / (precision + recall))
 
+# Calc Normal alignment
 def normal_alignment(
     pts_a: np.ndarray,
     nrm_a: np.ndarray,
@@ -125,6 +86,7 @@ def normal_alignment(
     dots = np.abs(np.sum(na * nb, axis=1))
     return float(dots.mean())
 
+# Calc Completeness
 def completeness(
     gt: np.ndarray,
     pred: np.ndarray,
@@ -133,6 +95,7 @@ def completeness(
     d, _ = tree.query(gt, k=1)
     return float(d.mean())
 
+# Calc Accuracy
 def accuracy(
     pred: np.ndarray,
     gt: np.ndarray
@@ -142,22 +105,13 @@ def accuracy(
     return float(d.mean())
 
 
-# Rotation function to align nerf synthetic meshes
+# Rotation function to align GT meshes
 def rotate_x(points: np.ndarray, degrees: float) -> np.ndarray:
     rad = np.deg2rad(degrees)
     R = np.array([
         [1, 0, 0],
         [0, np.cos(rad), -np.sin(rad)],
         [0, np.sin(rad),  np.cos(rad)],
-    ], dtype=np.float32)
-    return points @ R.T
-
-def rotate_y(points, degrees):
-    rad = np.deg2rad(degrees)
-    R = np.array([
-        [ np.cos(rad), 0, np.sin(rad)],
-        [ 0,           1, 0          ],
-        [-np.sin(rad), 0, np.cos(rad)],
     ], dtype=np.float32)
     return points @ R.T
 
@@ -180,13 +134,12 @@ def main():
     p.add_argument("mesh_b", type=str)
     p.add_argument("--samples", type=int, default=100_000, help="Samples per mesh, default 100.000)")
     p.add_argument("--f1_thresh", type=float, default=None, help="F1 threshold, default 1% of bbox diagonal")
-    p.add_argument("--vis_out",type=str,default=None,help="Path for debug visualization")
     args = p.parse_args()
 
-    print(f"[INFO] Sample {args.samples} point out of {args.mesh_a}")
+    print(f"[INFO] Sample {args.samples} points out of {args.mesh_a}")
     A, A_n = sample_geometry(args.mesh_a, args.samples)
 
-    print(f"[INFO] Sample {args.samples} point out of {args.mesh_b}")
+    print(f"[INFO] Sample {args.samples} points out of {args.mesh_b}")
     B, B_n = sample_geometry(args.mesh_b, args.samples)
 
     print("[INFO] Rotate mesh")
@@ -195,10 +148,6 @@ def main():
 
     print("[INFO] Normalize point clouds")
     A, B = normalize_bbox(A, B)
-
-    if args.vis_out is not None:
-        print(f"[INFO] Save visualization: {args.vis_out}")
-        save_pointcloud_visualization(A, B, args.vis_out)
 
     print("[INFO] Calculate Chamfer Distance:")
     cd = chamfer_distance(A, B)
